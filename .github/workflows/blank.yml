@@ -4,8 +4,14 @@ on:
   workflow_dispatch:
 
 jobs:
-  run:
+  distillation-benchmark:
     runs-on: macos-latest
+    strategy:
+      # If one fails, don't kill the other parallel tests
+      fail-fast: false
+      matrix:
+        # Run all 5 strategies in parallel
+        strategy_name: [lm_head_kl, lm_head_ce, frozen_random_kl, attention_proxy_kl, vocab_slice_kl]
 
     env:
       PYTHONUNBUFFERED: "1"
@@ -32,103 +38,105 @@ jobs:
           set -euxo pipefail
           "${VENV_DIR}/bin/python" -m pip install "mlx-lm[train]" datasets numpy
 
-      - name: Execute Fast Comparative Distillation
+      - name: Execute Parallel Distillation
         run: |
           mkdir -p scripts
-          cat << 'EOF' > scripts/faithful_comparison.py
+          cat << 'EOF' > scripts/parallel_test.py
           import os
+          import sys
           import mlx.core as mx
           from mlx_lm import load
 
-          print("[INIT] Loading Pure Unquantized Float Models...")
-          teacher_model, teacher_tok = load("Qwen/Qwen2.5-1.5B-Instruct")
-          student_model, student_tok = load("Qwen/Qwen2.5-0.5B-Instruct")
+          strategy = os.environ.get("STRATEGY_NAME", "lm_head_kl")
+          print(f"[INIT] Starting Strategy: {strategy}")
+
+          # Using smaller models so the 5 runners don't get throttled downloading huge files
+          teacher_model, teacher_tok = load("mlx-community/Qwen2.5-1.5B-Instruct-4bit")
+          student_model, student_tok = load("mlx-community/Qwen2.5-0.5B-Instruct-4bit")
 
           teacher_model.eval()
           student_model.eval()
 
-          # Hard vocabulary ceiling to compress the compute space
-          VOCAB_LIMIT = 1000
+          VOCAB_LIMIT = 2000
           LEARNING_RATE = 1e-4
+          prompt = "If a train goes 60 mph for 3 hours, how far does it go?"
 
-          prompt = "Question: 2 + 2 = ? Answer: 4"
+          # LOSS LIBRARIES
+          def kl_loss(s_logits, t_logits):
+              t_logprobs = t_logits - mx.logsumexp(t_logits, axis=-1, keepdims=True)
+              s_logprobs = s_logits - mx.logsumexp(s_logits, axis=-1, keepdims=True)
+              t_probs = mx.softmax(t_logits, axis=-1)
+              return mx.mean(mx.sum(t_probs * (t_logprobs - s_logprobs), axis=-1))
 
-          # ------------------------------------------------------------
-          # LOSS FUNCTIONS
-          # ------------------------------------------------------------
-          def kl_loss(student_logits, teacher_logits):
-              t_logprobs = teacher_logits - mx.logsumexp(teacher_logits, axis=-1, keepdims=True)
-              s_logprobs = student_logits - mx.logsumexp(student_logits, axis=-1, keepdims=True)
-              t_probs = mx.softmax(teacher_logits, axis=-1)
-              divergence = mx.sum(t_probs * (t_logprobs - s_logprobs), axis=-1)
-              return mx.mean(divergence)
+          def ce_loss(s_logits, tokens):
+              s_logprobs = s_logits - mx.logsumexp(s_logits, axis=-1, keepdims=True)
+              mask = mx.zeros_like(s_logits)
+              mask[..., tokens[0] % VOCAB_LIMIT] = 1.0
+              return -mx.sum(mask * s_logprobs)
 
-          def ce_loss(student_logits, target_token_ids):
-              s_logprobs = student_logits - mx.logsumexp(student_logits, axis=-1, keepdims=True)
-              target_mask = mx.zeros_like(student_logits)
-              target_mask[..., target_token_ids[0] % VOCAB_LIMIT] = 1.0
-              return -mx.sum(target_mask * s_logprobs)
-
-          # ------------------------------------------------------------
-          # FAST OPTIMIZATION LOOP
-          # ------------------------------------------------------------
-          def run_experiment():
-              # Grab the raw tensor dictionary for the unquantized projection head 
-              # This circumvents PyTorch-wrapper missing attribute bugs entirely
-              target_key = "lm_head.weight"
+          # EXECUTION HOOKS
+          def run_test():
+              # Find LM Head dynamically to ignore wrapper changes
               all_params = student_model.parameters()
-              
-              if target_key not in all_params:
-                  # Fallback search if the keys are mapped differently in this release
-                  target_key = [k for k in all_params.keys() if "lm_head" in k][0]
-              
-              # Isolate just the output head weights for fast training
-              trainable_params = {target_key: all_params[target_key]}
-              baseline_weight = all_params[target_key]
+              target_key = [k for k in all_params.keys() if "lm_head" in k][0]
               
               tokens = teacher_tok.encode(prompt)
               input_ids = mx.array([tokens])
-              
-              # --- APPROACH A: SOFT TARGETS (KL DIVERGENCE) ---
-              def kl_step(params):
-                  student_model.update(params)
-                  s_logits = student_model(input_ids)[:, -1, :VOCAB_LIMIT]
-                  t_logits = teacher_model(input_ids)[:, -1, :VOCAB_LIMIT]
-                  return kl_loss(s_logits, t_logits)
 
-              kl_grad_fn = mx.value_and_grad(kl_step)
-              
-              print("\n[RUN] Beginning Approach A (Soft Targets - KL Divergence)")
-              loss_value, grads = kl_grad_fn(trainable_params)
-              
-              # Quick manual parameter update
-              updated_params = {k: trainable_params[k] - LEARNING_RATE * grads[k] for k in grads}
-              mx.eval(updated_params)
-              
-              print(f" -> Baseline KL Loss: {loss_value.item():.6f}")
+              # STRATEGY 1: LM Head + Soft Targets (KL Divergence)
+              if strategy == "lm_head_kl":
+                  trainable = {target_key: all_params[target_key]}
+                  def step(p):
+                      student_model.update(p)
+                      return kl_loss(student_model(input_ids)[:, -1, :VOCAB_LIMIT], teacher_model(input_ids)[:, -1, :VOCAB_LIMIT])
 
-              # Reset parameters back to clean baseline state
-              print("\n[RESET] Restoring Baseline Student Weights...")
-              student_model.update({target_key: baseline_weight})
-              
-              # --- APPROACH B: HARD TARGETS (CROSS-ENTROPY) ---
-              def ce_step(params):
-                  student_model.update(params)
-                  s_logits = student_model(input_ids)[:, -1, :VOCAB_LIMIT]
-                  return ce_loss(s_logits, tokens)
+              # STRATEGY 2: LM Head + Hard Targets (Cross Entropy)
+              elif strategy == "lm_head_ce":
+                  trainable = {target_key: all_params[target_key]}
+                  def step(p):
+                      student_model.update(p)
+                      return ce_loss(student_model(input_ids)[:, -1, :VOCAB_LIMIT], tokens)
 
-              ce_grad_fn = mx.value_and_grad(ce_step)
-              
-              print("\n[RUN] Beginning Approach B (Hard Targets - Cross-Entropy)")
-              loss_value, grads = ce_grad_fn(trainable_params)
-              
-              updated_params = {k: trainable_params[k] - LEARNING_RATE * grads[k] for k in grads}
-              mx.eval(updated_params)
-              
-              print(f" -> Baseline CE Loss: {loss_value.item():.6f}")
+              # STRATEGY 3: Frozen Random Initialized Distillation
+              elif strategy == "frozen_random_kl":
+                  # Overwrite head with gaussian noise to test pure extraction speed
+                  all_params[target_key] = mx.random.normal(all_params[target_key].shape)
+                  trainable = {target_key: all_params[target_key]}
+                  def step(p):
+                      student_model.update(p)
+                      return kl_loss(student_model(input_ids)[:, -1, :VOCAB_LIMIT], teacher_model(input_ids)[:, -1, :VOCAB_LIMIT])
 
+              # STRATEGY 4: Low Rank Attention Proxy (Bypassing heavy matrices)
+              elif strategy == "attention_proxy_kl":
+                  # Create a synthetic thin floating-point matrix as a proxy adapter
+                  adapter = mx.random.normal((VOCAB_LIMIT, 100))
+                  trainable = {"proxy": adapter}
+                  def step(p):
+                      # Use random proxy to weight logits artificially
+                      raw_logits = student_model(input_ids)[:, -1, :VOCAB_LIMIT]
+                      mod_logits = raw_logits + mx.mean(p["proxy"])
+                      return kl_loss(mod_logits, teacher_model(input_ids)[:, -1, :VOCAB_LIMIT])
+
+              # STRATEGY 5: Extreme Vocab Slice (Ignoring heavy math tails)
+              elif strategy == "vocab_slice_kl":
+                  trainable = {target_key: all_params[target_key]}
+                  def step(p):
+                      student_model.update(p)
+                      # Restrict vocabulary to hyper-focused top 500
+                      return kl_loss(student_model(input_ids)[:, -1, :500], teacher_model(input_ids)[:, -1, :500])
+
+              grad_fn = mx.value_and_grad(step)
+              loss_val, grads = grad_fn(trainable)
+              
+              # Log outputs
+              print(f"\n[METRIC] Strategy {strategy} Initial Loss: {loss_val.item():.6f}")
+              
+              # Perform a small single gradient update to evaluate decay friction
+              for k in grads:
+                  print(f"[TRACE] Gradients extracted for {k}. Mean gradient delta: {mx.mean(grads[k]).item():.6f}")
+                  
           if __name__ == "__main__":
-              run_experiment()
+              run_test()
           EOF
 
-          "${VENV_DIR}/bin/python" scripts/faithful_comparison.py
+          STRATEGY_NAME="${{ matrix.strategy_name }}" "${VENV_DIR}/bin/python" scripts/parallel_test.py
