@@ -1,15 +1,11 @@
-name: separation-theorem-faithful-proof
+name: separation-theorem-preliminaries-probe
 
 on:
   workflow_dispatch:
 
 jobs:
-  distillation-benchmark:
+  probe-environment:
     runs-on: macos-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        strategy_name: [lm_head_kl, lm_head_ce, frozen_random_kl, attention_proxy_kl, vocab_slice_kl]
 
     env:
       PYTHONUNBUFFERED: "1"
@@ -36,96 +32,67 @@ jobs:
           set -euxo pipefail
           "${VENV_DIR}/bin/python" -m pip install "mlx-lm[train]" datasets numpy
 
-      - name: Execute Parallel Distillation
+      - name: Execute Extensive Diagnostics
         run: |
           mkdir -p scripts
-          cat << 'EOF' > scripts/parallel_test.py
-          import os
+          cat << 'EOF' > scripts/probe.py
           import sys
           import mlx.core as mx
           from mlx_lm import load
 
-          strategy = os.environ.get("STRATEGY_NAME", "lm_head_kl")
-          print(f"[INIT] Starting Strategy: {strategy}")
-
-          teacher_model, teacher_tok = load("mlx-community/Qwen2.5-1.5B-Instruct-4bit")
-          student_model, student_tok = load("mlx-community/Qwen2.5-0.5B-Instruct-4bit")
-
-          teacher_model.eval()
-          student_model.eval()
-
-          VOCAB_LIMIT = 2000
-          LEARNING_RATE = 1e-4
-          prompt = "If a train goes 60 mph for 3 hours, how far does it go?"
-
-          def kl_loss(s_logits, t_logits):
-              t_logprobs = t_logits - mx.logsumexp(t_logits, axis=-1, keepdims=True)
-              s_logprobs = s_logits - mx.logsumexp(s_logits, axis=-1, keepdims=True)
-              t_probs = mx.softmax(t_logits, axis=-1)
-              return mx.mean(mx.sum(t_probs * (t_logprobs - s_logprobs), axis=-1))
-
-          def ce_loss(s_logits, tokens):
-              s_logprobs = s_logits - mx.logsumexp(s_logits, axis=-1, keepdims=True)
-              mask = mx.zeros_like(s_logits)
-              mask[..., tokens[0] % VOCAB_LIMIT] = 1.0
-              return -mx.sum(mask * s_logprobs)
-
-          def run_test():
-              # FIX: Pulling weight directly without searching dictionary keys
-              base_head_weight = student_model.lm_head.weight
-              target_key = "lm_head.weight"
+          print("=== DIAGNOSTIC 1: MLX Environment ===")
+          print(f"Python version: {sys.version}")
+          print(f"MLX default device: {mx.default_device()}")
+          print(f"Is GPU available? {'Yes' if mx.metal.is_available() else 'No'}")
+          
+          print("\n=== DIAGNOSTIC 2: Model Architecture Discovery ===")
+          try:
+              # Loading student model to inspect its exact dictionary keys
+              student_model, student_tok = load("mlx-community/Qwen2.5-0.5B-Instruct-4bit")
+              print("-> Model loaded successfully.")
               
-              tokens = teacher_tok.encode(prompt)
-              input_ids = mx.array([tokens])
-
-              # 1: LM Head + Soft Targets (KL)
-              if strategy == "lm_head_kl":
-                  trainable = {target_key: base_head_weight}
-                  def step(p):
-                      student_model.lm_head.weight = p[target_key]
-                      return kl_loss(student_model(input_ids)[:, -1, :VOCAB_LIMIT], teacher_model(input_ids)[:, -1, :VOCAB_LIMIT])
-
-              # 2: LM Head + Hard Targets (CE)
-              elif strategy == "lm_head_ce":
-                  trainable = {target_key: base_head_weight}
-                  def step(p):
-                      student_model.lm_head.weight = p[target_key]
-                      return ce_loss(student_model(input_ids)[:, -1, :VOCAB_LIMIT], tokens)
-
-              # 3: Frozen Random Initialized Distillation
-              elif strategy == "frozen_random_kl":
-                  random_weight = mx.random.normal(base_head_weight.shape)
-                  trainable = {target_key: random_weight}
-                  def step(p):
-                      student_model.lm_head.weight = p[target_key]
-                      return kl_loss(student_model(input_ids)[:, -1, :VOCAB_LIMIT], teacher_model(input_ids)[:, -1, :VOCAB_LIMIT])
-
-              # 4: Low Rank Attention Proxy
-              elif strategy == "attention_proxy_kl":
-                  adapter = mx.random.normal((VOCAB_LIMIT, 100))
-                  trainable = {"proxy": adapter}
-                  def step(p):
-                      raw_logits = student_model(input_ids)[:, -1, :VOCAB_LIMIT]
-                      mod_logits = raw_logits + mx.mean(p["proxy"])
-                      return kl_loss(mod_logits, teacher_model(input_ids)[:, -1, :VOCAB_LIMIT])
-
-              # 5: Extreme Vocab Slice
-              elif strategy == "vocab_slice_kl":
-                  trainable = {target_key: base_head_weight}
-                  def step(p):
-                      student_model.lm_head.weight = p[target_key]
-                      return kl_loss(student_model(input_ids)[:, -1, :500], teacher_model(input_ids)[:, -1, :500])
-
-              grad_fn = mx.value_and_grad(step)
-              loss_val, grads = grad_fn(trainable)
+              # Pull all parameter dictionary keys
+              params = student_model.parameters()
+              print(f"Total parameter tensors found: {len(params)}")
               
-              print(f"\n[METRIC] Strategy {strategy} Initial Loss: {loss_val.item():.6f}")
+              print("\nSample of internal parameter keys:")
+              keys = list(params.keys())
+              for k in keys[:15]:
+                  print(f" - {k} | Shape: {params[k].shape}")
               
-              for k in grads:
-                  print(f"[TRACE] Gradients extracted for {k}. Mean gradient delta: {mx.mean(grads[k]).item():.6f}")
+              # Searching for projection head natively
+              lm_head_keys = [k for k in keys if "lm_head" in k]
+              head_keys = [k for k in keys if "head" in k]
+              print(f"\nKeys containing 'lm_head': {lm_head_keys}")
+              print(f"Keys containing 'head': {head_keys}")
+              
+          except Exception as e:
+              print(f"CRITICAL FAIL in architecture reading: {str(e)}")
+
+          print("\n=== DIAGNOSTIC 3: Gradient VJP Feasibility ===")
+          try:
+              # Testing if small scalar VJP math throws the QuantizedMatmul error
+              def dummy_loss(w):
+                  return mx.mean(w * 2.0)
                   
-          if __name__ == "__main__":
-              run_test()
+              grad_fn = mx.value_and_grad(dummy_loss)
+              test_tensor = mx.array([1.0, 2.0, 3.0])
+              val, grad = grad_fn(test_tensor)
+              print("Standard Float Gradient compute: SUCCESSFUL")
+              
+              # Attempt to pass gradient through loaded head
+              if lm_head_keys:
+                  def weight_loss(w_dict):
+                      return mx.mean(w_dict[lm_head_keys[0]])
+                  
+                  weight_grad_fn = mx.value_and_grad(weight_loss)
+                  val, grad = weight_grad_fn({lm_head_keys[0]: params[lm_head_keys[0]]})
+                  print("Model Weight Gradient compute: SUCCESSFUL")
+              else:
+                  print("Skipped weight gradient test (no keys found).")
+                  
+          except Exception as e:
+              print(f"VJP Compute failed: {str(e)}")
           EOF
 
-          STRATEGY_NAME="${{ matrix.strategy_name }}" "${VENV_DIR}/bin/python" scripts/parallel_test.py
+          "${VENV_DIR}/bin/python" scripts/probe.py
