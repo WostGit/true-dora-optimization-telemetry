@@ -39,10 +39,10 @@ jobs:
           import os
           import copy
           import mlx.core as mx
+          import mlx.optimizers as optim
           from mlx_lm import load
 
           print("[INIT] Loading Pure Unquantized Float Models...")
-          # Loading actual floating point models to guarantee gradient support
           teacher_model, teacher_tok = load("Qwen/Qwen2.5-1.5B-Instruct")
           student_model, student_tok = load("Qwen/Qwen2.5-0.5B-Instruct")
 
@@ -77,9 +77,11 @@ jobs:
           # OPTIMIZATION LOOP
           # ------------------------------------------------------------
           def run_experiment():
-              # We can finally train all model parameters because they are unquantized!
-              trainable_params = student_model.parameters()
-              baseline_params = copy.deepcopy(trainable_params)
+              # Capture the clean state of parameters
+              baseline_params = copy.deepcopy(student_model.parameters())
+              
+              # Use MLX's native SGD optimizer to handle dictionary updates
+              optimizer = optim.SGD(learning_rate=LEARNING_RATE)
               
               # --- APPROACH A: SOFT TARGETS (KL DIVERGENCE) ---
               def kl_step(params, input_ids):
@@ -97,19 +99,19 @@ jobs:
                       tokens = teacher_tok.encode(prompt)
                       input_ids = mx.array([tokens])
                       
-                      loss_value, grads = kl_grad_fn(trainable_params, input_ids)
+                      # Grads is safely captured as a parameter dictionary tree
+                      loss_value, grads = kl_grad_fn(student_model.parameters(), input_ids)
                       
-                      for k in grads.keys():
-                          trainable_params[k] = trainable_params[k] - LEARNING_RATE * grads[k]
-                          
-                      mx.eval(trainable_params)
+                      # Optimizer handles the dictionary math safely
+                      optimizer.update(student_model, grads)
+                      
+                      mx.eval(student_model.parameters())
                       total_loss += loss_value.item()
                   print(f" [EPOCH {epoch:02d}] Total KL Loss: {total_loss:.6f}")
 
               # Reset parameters back to clean baseline state
               print("\n[RESET] Restoring Baseline Student Weights...")
               student_model.update(baseline_params)
-              trainable_params = student_model.parameters()
 
               # --- APPROACH B: HARD TARGETS (CROSS-ENTROPY) ---
               def ce_step(params, input_ids, tokens):
@@ -126,12 +128,11 @@ jobs:
                       tokens = teacher_tok.encode(prompt)
                       input_ids = mx.array([tokens])
                       
-                      loss_value, grads = ce_grad_fn(trainable_params, input_ids, tokens)
+                      loss_value, grads = ce_grad_fn(student_model.parameters(), input_ids, tokens)
                       
-                      for k in grads.keys():
-                          trainable_params[k] = trainable_params[k] - LEARNING_RATE * grads[k]
-                          
-                      mx.eval(trainable_params)
+                      optimizer.update(student_model, grads)
+                      
+                      mx.eval(student_model.parameters())
                       total_loss += loss_value.item()
                   print(f" [EPOCH {epoch:02d}] Total CE Loss: {total_loss:.6f}")
 
