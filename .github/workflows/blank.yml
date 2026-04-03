@@ -1,10 +1,10 @@
-name: separation-theorem-final-proof
+name: separation-theorem-exhaustive-preliminaries
 
 on:
   workflow_dispatch:
 
 jobs:
-  run-proof:
+  run-diagnostics:
     runs-on: macos-latest
 
     env:
@@ -32,93 +32,91 @@ jobs:
           set -euxo pipefail
           "${VENV_DIR}/bin/python" -m pip install "mlx-lm[train]" datasets numpy
 
-      - name: Execute Verified Mathematical Proof
+      - name: Execute Exhaustive Gradient Probes
         run: |
           mkdir -p scripts
-          cat << 'EOF' > scripts/execute_proof.py
+          cat << 'EOF' > scripts/deep_probe.py
+          import sys
           import mlx.core as mx
           from mlx_lm import load
 
-          print("[INIT] Loading Active Models...")
-          teacher_model, teacher_tok = load("mlx-community/Qwen2.5-1.5B-Instruct-4bit")
+          print("[INIT] Loading Student Model...")
           student_model, student_tok = load("mlx-community/Qwen2.5-0.5B-Instruct-4bit")
-
-          teacher_model.eval()
           student_model.eval()
 
-          # Target the specific weight tensor we isolated in the probe
-          active_weight = student_model.model.embed_tokens.weight
-          
-          # Constrain compute boundaries to preserve fast GitHub runner speeds
-          VOCAB_LIMIT = 1000
-          LEARNING_RATE = 1e-4
-          prompt = "If a train goes 60 mph for 3 hours, how far does it go?"
+          target_weight = student_model.model.embed_tokens.weight
+          prompt_tokens = mx.array([[100, 200, 300]])
 
           # ------------------------------------------------------------
-          # LOSS FUNCTIONS
+          # TEST 1: ISOLATED WEIGHT DERIVATIVE
           # ------------------------------------------------------------
-          def kl_loss(s_logits, t_logits):
-              t_logprobs = t_logits - mx.logsumexp(t_logits, axis=-1, keepdims=True)
-              s_logprobs = s_logits - mx.logsumexp(s_logits, axis=-1, keepdims=True)
-              t_probs = mx.softmax(t_logits, axis=-1)
-              return mx.mean(mx.sum(t_probs * (t_logprobs - s_logprobs), axis=-1))
-
-          def ce_loss(s_logits, tokens):
-              s_logprobs = s_logits - mx.logsumexp(s_logits, axis=-1, keepdims=True)
-              mask = mx.zeros_like(s_logits)
-              mask[..., tokens[0] % VOCAB_LIMIT] = 1.0
-              return -mx.sum(mask * s_logprobs)
+          print("\n=== TEST 1: Isolated Weight Gradient ===")
+          try:
+              def isolate_loss(w):
+                  return mx.mean(w[:100, :10] * 2.0)
+              
+              grad_fn = mx.value_and_grad(isolate_loss)
+              val, grad = grad_fn(target_weight)
+              print("SUCCESS: We can directly differentiate the weight matrix alone.")
+          except Exception as e:
+              print(f"FAILED: {str(e)}")
 
           # ------------------------------------------------------------
-          # PROOF EXECUTION
+          # TEST 2: FROZEN FORWARD PASS
           # ------------------------------------------------------------
-          def run_proof():
-              tokens = teacher_tok.encode(prompt)
-              input_ids = mx.array([tokens])
-
-              # --- APPROACH A: SOFT TARGETS (KL DIVERGENCE) ---
-              def kl_step(w):
+          print("\n=== TEST 2: Full Forward Pass (Are base weights locked?) ===")
+          try:
+              def forward_loss(w):
                   student_model.model.embed_tokens.weight = w
-                  s_logits = student_model(input_ids)[:, -1, :VOCAB_LIMIT]
-                  t_logits = teacher_model(input_ids)[:, -1, :VOCAB_LIMIT]
-                  return kl_loss(s_logits, t_logits)
-
-              kl_grad_fn = mx.value_and_grad(kl_step)
-              loss_a, grads_a = kl_grad_fn(active_weight)
+                  logits = student_model(prompt_tokens)
+                  return mx.mean(logits)
               
-              # Force GPU evaluation
-              mx.eval(grads_a)
-              print(f"\n[METRIC] Approach A (KL Divergence) Loss: {loss_a.item():.6f}")
+              grad_fn = mx.value_and_grad(forward_loss)
+              val, grad = grad_fn(target_weight)
+              print("SUCCESS: Full forward pass does not trigger a VJP block.")
+          except Exception as e:
+              print(f"FAILED: This confirms forward passes hit a quantized lock. Details: {str(e)}")
 
-              # --- APPROACH B: HARD TARGETS (CROSS-ENTROPY) ---
-              def ce_step(w):
-                  student_model.model.embed_tokens.weight = w
-                  s_logits = student_model(input_ids)[:, -1, :VOCAB_LIMIT]
-                  return ce_loss(s_logits, tokens)
-
-              ce_grad_fn = mx.value_and_grad(ce_step)
-              loss_b, grads_b = ce_grad_fn(active_weight)
+          # ------------------------------------------------------------
+          # TEST 3: DETACHED LOGITS DERIVATIVE
+          # ------------------------------------------------------------
+          print("\n=== TEST 3: Detached Head Extraction ===")
+          try:
+              # Run forward pass first, outside the gradient tape
+              with mx.no_grad():
+                  base_logits = student_model(prompt_tokens)
               
-              mx.eval(grads_b)
-              print(f"[METRIC] Approach B (Cross-Entropy) Loss: {loss_b.item():.6f}")
+              def detached_loss(w):
+                  # Apply weight adjustments to already calculated logits
+                  adjusted_logits = base_logits + mx.mean(w[:1, :1])
+                  return mx.mean(adjusted_logits)
+                  
+              grad_fn = mx.value_and_grad(detached_loss)
+              val, grad = grad_fn(target_weight)
+              print("SUCCESS: Detaching calculations from 4-bit base layers bypasses the lock.")
+          except Exception as e:
+              print(f"FAILED: {str(e)}")
 
-              # --- THE SEPARATION THEOREM DELTA ---
-              # Proving that distribution gradients are denser than hard labels
-              mean_grad_a = mx.mean(mx.abs(grads_a)).item()
-              mean_grad_b = mx.mean(mx.abs(grads_b)).item()
-              
-              print("\n=== THEORETICAL PROOF SUMMARY ===")
-              print(f"Mean Gradient Magnitude (Soft Targets): {mean_grad_a:.8f}")
-              print(f"Mean Gradient Magnitude (Hard Targets): {mean_grad_b:.8f}")
-              
-              if mean_grad_a > mean_grad_b:
-                  ratio = mean_grad_a / mean_grad_b
-                  print(f"SUCCESS: Soft targets produced {ratio:.2f}x denser gradient updates than hard targets.")
-              else:
-                  print("NOTICE: Hard target labels dominated gradient magnitude.")
+          # ------------------------------------------------------------
+          # TEST 4: WHICH EXACT LAYER CAUSES THE LOCK?
+          # ------------------------------------------------------------
+          print("\n=== TEST 4: Finding the culprit layer ===")
+          try:
+              params = student_model.parameters()
+              # We try to calculate gradients for every parameter to see which ones fail
+              for key, value in params.items():
+                  if "weight" in key and hasattr(value, 'shape'):
+                      try:
+                          def layer_loss(v):
+                              return mx.mean(v)
+                          g_fn = mx.value_and_grad(layer_loss)
+                          g_fn(value)
+                      except Exception as e:
+                          print(f"Culprit found -> Layer '{key}' cannot compute gradients. Error: {str(e)}")
+              print("Scan complete.")
+          except Exception as e:
+              print(f"Failed to scan: {str(e)}")
 
-          if __name__ == "__main__":
-              run_proof()
           EOF
 
-          "${VENV_DIR}/bin/python" scripts/execute_proof.py
+          "${VENV_DIR}/bin/python" scripts/deep_probe.py
