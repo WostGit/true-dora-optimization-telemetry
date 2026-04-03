@@ -10,7 +10,6 @@ jobs:
     env:
       PYTHONUNBUFFERED: "1"
       HF_HOME: ${{ github.workspace }}/.hf-cache
-      # Using smaller models to ensure the free GitHub runner doesn't run out of memory
       MODEL: mlx-community/Qwen2.5-0.5B-Instruct-4bit
       VENV_DIR: ${{ github.workspace }}/.venv
 
@@ -32,7 +31,6 @@ jobs:
       - name: Install MLX and Dependencies
         run: |
           set -euxo pipefail
-          # We need mlx-lm to run the native LoRA/DoRA trainer
           "${VENV_DIR}/bin/python" -m pip install "mlx-lm[train]" datasets numpy
 
       - name: Generate Training Data (XAI Teacher Leakage)
@@ -56,17 +54,16 @@ jobs:
           echo "[INIT] BEGINNING DECOUPLED DORA WEIGHT TRAINING"
           echo "[INIT] ========================================================"
           
-          # We call the native MLX DoRA trainer.
-          # We explicitly set --fine-tune-type dora.
-          # We specify a high learning rate to force the loss to drop aggressively in just 100 iterations.
+          # Using the correct non-deprecated MLX syntax
+          # Dropped the learning rate to 1e-4 to ensure numerical stability and prevent NaNs
           
-          "${VENV_DIR}/bin/python" -m mlx_lm.lora \
+          "${VENV_DIR}/bin/python" -m mlx_lm lora \
             --model "${{ env.MODEL }}" \
             --data ./data \
             --train \
             --fine-tune-type dora \
             --iters 100 \
-            --learning-rate 1e-3 \
+            --learning-rate 1e-4 \
             --batch-size 1 \
             --num-layers 4
 
