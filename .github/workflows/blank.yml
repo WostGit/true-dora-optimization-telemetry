@@ -32,10 +32,10 @@ jobs:
           set -euxo pipefail
           "${VENV_DIR}/bin/python" -m pip install "mlx-lm[train]" datasets numpy
 
-      - name: Execute 16-bit True Proof
+      - name: Execute Verbose Proof
         run: |
           mkdir -p scripts
-          cat << 'EOF' > scripts/true_proof.py
+          cat << 'EOF' > scripts/verbose_proof.py
           import mlx.core as mx
           from mlx_lm import load
 
@@ -44,102 +44,92 @@ jobs:
           student_model, student_tok = load("mlx-community/Qwen2.5-0.5B-Instruct-bf16")
 
           teacher_model.eval()
-          student_model.train() # Keep student in training mode for the tape
+          student_model.train() 
 
-          VOCAB_LIMIT = 2000
+          VOCAB_LIMIT = 500  # Narrowed limit to make verbose printing readable
           tokens = student_tok.encode("The quick brown fox jumps over")
           input_ids = mx.array([tokens])
+
+          # Target label extraction
+          target_id = tokens[0] % VOCAB_LIMIT
+
+          print("\n=== INPUT VERBOSE METRICS ===")
+          print(f"Prompt Tokens: {tokens}")
+          print(f"Hard Target Token ID mapped to vocab slice: {target_id}")
 
           # 1. Forward pass for frozen teacher logits
           t_logits = teacher_model(input_ids)[:, -1, :VOCAB_LIMIT]
           teacher_logits = mx.stop_gradient(t_logits)
 
-          # Helper function to extract mean absolute gradient across all model parameters
-          def extract_mean_grad(grads):
+          print("\n=== TEACHER LOGITS DISTRIBUTION ===")
+          print(f"Teacher Logits Shape: {teacher_logits.shape}")
+          print(f"Teacher Logits Max: {mx.max(teacher_logits).item():.4f}")
+          print(f"Teacher Logits Min: {mx.min(teacher_logits).item():.4f}")
+          print(f"Teacher Logits Mean: {mx.mean(teacher_logits).item():.4f}")
+          
+          t_probs = mx.softmax(teacher_logits, axis=-1)
+          print(f"Teacher Probabilities (Top 5): {mx.sort(t_probs)[..., -5:].tolist()}")
+
+          def extract_verbose_grad(grads, name="Gradients"):
               total_abs_sum = 0.0
               total_count = 0
-              # Recursively traverse the dictionary of gradients
+              flat_samples = []
+              
               def traverse(g):
-                  nonlocal total_abs_sum, total_count
+                  nonlocal total_abs_sum, total_count, flat_samples
                   if isinstance(g, dict):
                       for k, v in g.items():
                           traverse(v)
                   elif isinstance(g, mx.array):
                       total_abs_sum += mx.sum(mx.abs(g)).item()
                       total_count += g.size
+                      if len(flat_samples) < 5:
+                          flat_samples.extend(g.flatten()[:5].tolist())
+              
               traverse(grads)
-              return total_abs_sum / total_count if total_count > 0 else 0.0
-
-          def compare_and_print(name, grads_a, grads_b):
-              mean_a = extract_mean_grad(grads_a)
-              mean_b = extract_mean_grad(grads_b)
+              mean_val = total_abs_sum / total_count if total_count > 0 else 0.0
               
-              print(f"\n=== Strategy: {name} ===")
-              print(f"  Soft Target Grad Mean: {mean_a:.8f}")
-              print(f"  Hard Target Grad Mean: {mean_b:.8f}")
-              
-              if mean_a > mean_b:
-                  print(f"  -> SUCCESS! Soft targets are {mean_a / (mean_b if mean_b > 0 else 1e-10):.2f}x denser.")
-              else:
-                  print(f"  -> Hard targets won by {mean_b / (mean_a if mean_a > 0 else 1e-10):.2f}x.")
+              print(f"\n[{name}]")
+              print(f"  Mean Abs Value: {mean_val:.8f}")
+              print(f"  Sample values (first 5 found): {[f'{x:.8f}' for x in flat_samples[:5]]}")
+              return mean_val
 
-          def kl_loss(s_logits, t_logits, T=1.0):
-              t_probs = mx.softmax(t_logits / T, axis=-1)
-              s_logprobs = s_logits / T - mx.logsumexp(s_logits / T, axis=-1, keepdims=True)
+          def kl_loss(s_logits, t_logits):
+              t_probs = mx.softmax(t_logits, axis=-1)
+              s_logprobs = s_logits - mx.logsumexp(s_logits, axis=-1, keepdims=True)
               return mx.mean(mx.sum(t_probs * -s_logprobs, axis=-1))
 
-          def ce_loss(s_logits, smooth=0.0):
+          def ce_loss(s_logits):
               s_logprobs = s_logits - mx.logsumexp(s_logits, axis=-1, keepdims=True)
-              if smooth == 0.0:
-                  return -s_logprobs[..., tokens[0] % VOCAB_LIMIT].mean()
-              else:
-                  smooth_target = mx.ones_like(s_logits) * (smooth / VOCAB_LIMIT)
-                  smooth_target[..., tokens[0] % VOCAB_LIMIT] = 1.0 - smooth
-                  return mx.mean(mx.sum(smooth_target * -s_logprobs, axis=-1))
+              return -s_logprobs[..., target_id].mean()
 
-          # Extract model parameters
           params = student_model.parameters()
 
-          # --- RUNNING ALL OPTIONS NATIVELY ---
-          # Note: The functions now accept `p` (parameters) so mx.grad works perfectly.
+          # --- RUN AND INSPECT ---
 
-          # Option 1: Standard Play (T=1)
-          def opt1_a(p): 
-              student_model.update(p)
-              return kl_loss(student_model(input_ids)[:, -1, :VOCAB_LIMIT], teacher_logits)
-              
-          def opt1_b(p): 
+          # A. RUNNING HARD TARGET TRACE
+          student_model.update(params)
+          s_logits_hard = student_model(input_ids)[:, -1, :VOCAB_LIMIT]
+          
+          print("\n=== STUDENT LOGITS BEFORE LOSS ===")
+          print(f"Student Logits Max: {mx.max(s_logits_hard).item():.4f}")
+          print(f"Student Logits Min: {mx.min(s_logits_hard).item():.4f}")
+
+          def opt_hard(p):
               student_model.update(p)
               return ce_loss(student_model(input_ids)[:, -1, :VOCAB_LIMIT])
 
-          grads_a1 = mx.grad(opt1_a)(params)
-          grads_b1 = mx.grad(opt1_b)(params)
-          compare_and_print("1. Standard Baseline (T=1.0)", grads_a1, grads_b1)
+          grads_hard = mx.grad(opt_hard)(params)
+          extract_verbose_grad(grads_hard, name="HARD TARGET GRADIENTS")
 
-          # Option 2: High Temperature (T=2.0)
-          def opt2_a(p): 
+          # B. RUNNING SOFT TARGET TRACE
+          def opt_soft(p):
               student_model.update(p)
-              return kl_loss(student_model(input_ids)[:, -1, :VOCAB_LIMIT], teacher_logits, T=2.0)
-              
-          grads_a2 = mx.grad(opt2_a)(params)
-          compare_and_print("2. High Temperature (T=2.0)", grads_a2, grads_b1)
+              return kl_loss(student_model(input_ids)[:, -1, :VOCAB_LIMIT], teacher_logits)
 
-          # Option 3: Low Temperature (T=0.5)
-          def opt3_a(p): 
-              student_model.update(p)
-              return kl_loss(student_model(input_ids)[:, -1, :VOCAB_LIMIT], teacher_logits, T=0.5)
-              
-          grads_a3 = mx.grad(opt3_a)(params)
-          compare_and_print("3. Low Temperature (T=0.5)", grads_a3, grads_b1)
-
-          # Option 4: Label Smoothing (epsilon = 0.1)
-          def opt4_b(p): 
-              student_model.update(p)
-              return ce_loss(student_model(input_ids)[:, -1, :VOCAB_LIMIT], smooth=0.1)
-              
-          grads_b4 = mx.grad(opt4_b)(params)
-          compare_and_print("4. Hard Label Smoothing", grads_a1, grads_b4)
+          grads_soft = mx.grad(opt_soft)(params)
+          extract_verbose_grad(grads_soft, name="SOFT TARGET GRADIENTS")
 
           EOF
 
-          "${VENV_DIR}/bin/python" scripts/true_proof.py
+          "${VENV_DIR}/bin/python" scripts/verbose_proof.py
