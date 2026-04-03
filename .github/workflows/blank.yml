@@ -1,4 +1,4 @@
-name: separation-theorem-dora-proof
+name: separation-theorem-faithful-proof
 
 on:
   workflow_dispatch:
@@ -10,8 +10,6 @@ jobs:
     env:
       PYTHONUNBUFFERED: "1"
       HF_HOME: ${{ github.workspace }}/.hf-cache
-      TEACHER_MODEL: mlx-community/Qwen2.5-1.5B-Instruct-4bit
-      STUDENT_MODEL: mlx-community/Qwen2.5-0.5B-Instruct-4bit
       VENV_DIR: ${{ github.workspace }}/.venv
 
     steps:
@@ -34,113 +32,77 @@ jobs:
           set -euxo pipefail
           "${VENV_DIR}/bin/python" -m pip install "mlx-lm[train]" datasets numpy
 
-      - name: Execute Faithful DoRA Comparison
+      - name: Execute Faithful Custom KL Distillation
         run: |
           mkdir -p scripts
-          cat << 'EOF' > scripts/faithful_dora.py
+          cat << 'EOF' > scripts/faithful_kl.py
           import os
-          import time
-          import numpy as np
           import mlx.core as mx
           from mlx_lm import load
+
+          print("[INIT] Loading Active Weight Tensors...")
+          # Loading actual Qwen models
+          teacher_model, teacher_tok = load("mlx-community/Qwen2.5-1.5B-Instruct-4bit")
+          student_model, student_tok = load("mlx-community/Qwen2.5-0.5B-Instruct-4bit")
+
+          teacher_model.eval()
+          student_model.eval()
+
+          VOCAB_LIMIT = 2000
+          LEARNING_RATE = 1e-5
 
           prompts = [
               "Question: If a train travels at 60 mph for 3 hours, how far does it go? Answer: 180 miles.",
               "Question: Solve for x: 2x + 5 = 15. Answer: x = 5."
           ]
 
-          print("\n[INIT] Models Loading...")
-          teacher_model, teacher_tok = load(os.environ["TEACHER_MODEL"])
-          student_model, student_tok = load(os.environ["STUDENT_MODEL"])
-
-          teacher_model.eval()
-          student_model.eval()
-
-          # Target vocab slice to fit within runner limits
-          vocab_dim = 1000 
-          rank = 8
-          lr = 1e-4
-
-          # Reconstructs clean, uniform DoRA matrices for each run
-          def get_dora_params():
-              np.random.seed(42)
-              return {
-                  "m": mx.array(np.random.randn(vocab_dim, 1) * 0.01),
-                  "A": mx.array(np.random.randn(vocab_dim, rank) * 0.01),
-                  "B": mx.array(np.random.randn(rank, vocab_dim) * 0.01)
-              }
-
-          def get_dora_logits(p, base_logits):
-              # Replicating true DoRA: m * (V / ||V||)
-              V = mx.matmul(p["A"], p["B"])
-              V_norm = mx.linalg.norm(V, axis=-1, keepdims=True) + 1e-6
-              dora_matrix = p["m"] * (V / V_norm)
-              return base_logits + mx.mean(dora_matrix, axis=-1)
-
-          # ------------------------------------------------------------
-          # APPROACH B: HARD TARGETS (DoRA + Cross Entropy)
-          # ------------------------------------------------------------
-          print("\n[RUN] Beginning Approach B (DoRA + Hard Targets)")
-          params_b = get_dora_params()
-
-          def ce_loss_fn(p, s_base_logits, target_token_ids):
-              adapted_logits = get_dora_logits(p, s_base_logits)
+          def kl_loss(student_logits, teacher_logits):
+              # LogSumExp over vocab axis for numerical stability
+              t_logprobs = teacher_logits - mx.logsumexp(teacher_logits, axis=-1, keepdims=True)
+              s_logprobs = student_logits - mx.logsumexp(student_logits, axis=-1, keepdims=True)
               
-              target_mask = mx.zeros_like(adapted_logits)
-              target_mask[..., target_token_ids[0] % vocab_dim] = 1.0
+              t_probs = mx.softmax(teacher_logits, axis=-1)
               
-              s_logprobs = adapted_logits - mx.logsumexp(adapted_logits, axis=-1, keepdims=True)
-              return -mx.sum(target_mask * (s_logprobs - 1e-9))
+              # Standard KL Divergence equation
+              divergence = mx.sum(t_probs * (t_logprobs - s_logprobs), axis=-1)
+              return mx.mean(divergence)
 
-          ce_grad_fn = mx.value_and_grad(ce_loss_fn)
-
-          for epoch in range(1, 4):
-              total_loss = 0.0
-              for prompt in prompts:
-                  tokens = teacher_tok.encode(prompt)
-                  input_ids = mx.array([tokens])
-                  s_base_logits = student_model(input_ids)[:, -1, :vocab_dim]
-                  
-                  loss_value, grads = ce_grad_fn(params_b, s_base_logits, tokens)
-                  
-                  for k in params_b:
-                      params_b[k] = params_b[k] - lr * grads[k]
-                  total_loss += loss_value.item()
-              print(f" [EPOCH {epoch:02d}] Total Hard Loss: {total_loss:.6f}")
-
-          # ------------------------------------------------------------
-          # APPROACH A: SOFT TARGETS (DoRA + KL Divergence)
-          # ------------------------------------------------------------
-          print("\n[RUN] Beginning Approach A (DoRA + Soft Targets)")
-          params_a = get_dora_params()
-
-          def kl_loss_fn(p, t_logits, s_base_logits):
-              adapted_logits = get_dora_logits(p, s_base_logits)
+          def run_distillation(epochs=3):
+              # Targeting the actual parameters of the student's output head
+              trainable_params = student_model.lm_head.parameters()
               
-              t_logprobs = t_logits - mx.logsumexp(t_logits, axis=-1, keepdims=True)
-              s_logprobs = adapted_logits - mx.logsumexp(adapted_logits, axis=-1, keepdims=True)
+              def loss_compute_step(params, input_ids):
+                  student_model.lm_head.update(params)
+                  
+                  s_logits = student_model(input_ids)[:, -1, :VOCAB_LIMIT]
+                  t_logits = teacher_model(input_ids)[:, -1, :VOCAB_LIMIT]
+                  
+                  return kl_loss(s_logits, t_logits)
+
+              # Real MLX auto-differentiation mapped to actual tensors
+              grad_fn = mx.value_and_grad(loss_compute_step)
               
-              t_probs = mx.softmax(t_logits, axis=-1)
-              return mx.sum(t_probs * (t_logprobs - s_logprobs))
-
-          kl_grad_fn = mx.value_and_grad(kl_loss_fn)
-
-          for epoch in range(1, 4):
-              total_loss = 0.0
-              for prompt in prompts:
-                  tokens = teacher_tok.encode(prompt)
-                  input_ids = mx.array([tokens])
+              print("\n[RUN] Beginning True Distribution Mapping...")
+              for epoch in range(1, epochs + 1):
+                  total_loss = 0.0
                   
-                  t_logits = teacher_model(input_ids)[:, -1, :vocab_dim]
-                  s_base_logits = student_model(input_ids)[:, -1, :vocab_dim]
-                  
-                  loss_value, grads = kl_grad_fn(params_a, t_logits, s_base_logits)
-                  
-                  for k in params_a:
-                      params_a[k] = params_a[k] - lr * grads[k]
-                  total_loss += loss_value.item()
-              print(f" [EPOCH {epoch:02d}] Total Soft Loss: {total_loss:.6f}")
+                  for prompt in prompts:
+                      tokens = teacher_tok.encode(prompt)
+                      input_ids = mx.array([tokens])
+                      
+                      loss_value, grads = grad_fn(trainable_params, input_ids)
+                      
+                      # Active backpropagation via SGD
+                      for k in trainable_params.keys():
+                          trainable_params[k] = trainable_params[k] - LEARNING_RATE * grads[k]
+                          
+                      mx.eval(trainable_params)
+                      total_loss += loss_value.item()
+                      
+                  print(f" [EPOCH {epoch:02d}] Total KL Loss: {total_loss:.6f}")
 
+          if __name__ == "__main__":
+              run_distillation()
           EOF
 
-          "${VENV_DIR}/bin/python" scripts/faithful_dora.py
+          "${VENV_DIR}/bin/python" scripts/faithful_kl.py
