@@ -32,7 +32,7 @@ jobs:
           set -euxo pipefail
           "${VENV_DIR}/bin/python" -m pip install "mlx-lm[train]" datasets numpy
 
-      - name: Execute Faithful Comparative Distillation
+      - name: Execute Faithful Comparative Distillation (8-bit)
         run: |
           mkdir -p scripts
           cat << 'EOF' > scripts/faithful_comparison.py
@@ -41,17 +41,17 @@ jobs:
           import mlx.core as mx
           from mlx_lm import load
 
-          print("[INIT] Loading Active Weight Tensors...")
-          # Loading actual Qwen models
-          teacher_model, teacher_tok = load("mlx-community/Qwen2.5-1.5B-Instruct-4bit")
-          student_model, student_tok = load("mlx-community/Qwen2.5-0.5B-Instruct-4bit")
+          print("[INIT] Loading Active 8-Bit Weight Tensors...")
+          # Loading actual 8-bit Qwen models to bypass VJP gradient locks
+          teacher_model, teacher_tok = load("mlx-community/Qwen2.5-1.5B-Instruct-8bit")
+          student_model, student_tok = load("mlx-community/Qwen2.5-0.5B-Instruct-8bit")
 
           teacher_model.eval()
           student_model.eval()
 
-          # To keep the action runner's memory safe and fast
+          # Safe limits for memory management on the runner
           VOCAB_LIMIT = 2000
-          LEARNING_RATE = 1e-4
+          LEARNING_RATE = 1e-5
 
           prompts = [
               "Question: If a train travels at 60 mph for 3 hours, how far does it go? Answer: 180 miles.",
@@ -78,13 +78,13 @@ jobs:
           # OPTIMIZATION LOOP
           # ------------------------------------------------------------
           def run_experiment():
-              # FOCUS ON LM_HEAD: This bypasses quantized weight gradient errors entirely!
-              trainable_params = student_model.lm_head.parameters()
+              # We use .parameters() which is natively supported on 8-bit floats
+              trainable_params = student_model.parameters()
               baseline_params = copy.deepcopy(trainable_params)
               
               # --- APPROACH A: SOFT TARGETS (KL DIVERGENCE) ---
               def kl_step(params, input_ids):
-                  student_model.lm_head.update(params)
+                  student_model.update(params)
                   s_logits = student_model(input_ids)[:, -1, :VOCAB_LIMIT]
                   t_logits = teacher_model(input_ids)[:, -1, :VOCAB_LIMIT]
                   return kl_loss(s_logits, t_logits)
@@ -100,7 +100,6 @@ jobs:
                       
                       loss_value, grads = kl_grad_fn(trainable_params, input_ids)
                       
-                      # Map gradients only to the active float weights
                       for k in grads.keys():
                           trainable_params[k] = trainable_params[k] - LEARNING_RATE * grads[k]
                           
@@ -110,12 +109,12 @@ jobs:
 
               # Reset parameters back to clean baseline state
               print("\n[RESET] Restoring Baseline Student Weights...")
-              student_model.lm_head.update(baseline_params)
-              trainable_params = student_model.lm_head.parameters()
+              student_model.update(baseline_params)
+              trainable_params = student_model.parameters()
 
               # --- APPROACH B: HARD TARGETS (CROSS-ENTROPY) ---
               def ce_step(params, input_ids, tokens):
-                  student_model.lm_head.update(params)
+                  student_model.update(params)
                   s_logits = student_model(input_ids)[:, -1, :VOCAB_LIMIT]
                   return ce_loss(s_logits, tokens)
 
