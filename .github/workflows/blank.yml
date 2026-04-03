@@ -1,4 +1,4 @@
-name: separation-theorem-extensive-preliminaries
+name: separation-theorem-exhaustive-preliminaries
 
 on:
   workflow_dispatch:
@@ -32,88 +32,57 @@ jobs:
           set -euxo pipefail
           "${VENV_DIR}/bin/python" -m pip install "mlx-lm[train]" datasets numpy
 
-      - name: Execute Massive Diagnostics
+      - name: Execute Laser Diagnostic
         run: |
           mkdir -p scripts
-          cat << 'EOF' > scripts/probe.py
+          cat << 'EOF' > scripts/laser_probe.py
           import sys
-          import time
           import mlx.core as mx
           from mlx_lm import load
 
-          print("=== DIAGNOSTIC 1: MLX Environment ===")
-          print(f"Python version: {sys.version}")
-          print(f"MLX default device: {mx.default_device()}")
-          print(f"Is GPU available? {'Yes' if mx.metal.is_available() else 'No'}")
-          
-          print("\n=== DIAGNOSTIC 2: Recursive Architecture Discovery ===")
+          print("=== PROBE 1: Loading & Inspecting Model Instance ===")
           try:
-              student_model, student_tok = load("mlx-community/Qwen2.5-0.5B-Instruct-4bit")
-              print("-> Model loaded successfully.")
+              model, tok = load("mlx-community/Qwen2.5-0.5B-Instruct-4bit")
+              print(f"Model Python Class: {type(model)}")
               
-              nested_params = student_model.parameters()
-              flattened_keys = []
+              # Inspecting Python attributes directly to ignore dictionary mappings
+              print(f"Has model.model? {hasattr(model, 'model')}")
+              print(f"Has model.lm_head? {hasattr(model, 'lm_head')}")
+              print(f"Has model.embed_tokens? {hasattr(model, 'embed_tokens') if not hasattr(model, 'model') else hasattr(model.model, 'embed_tokens')}")
+          except Exception as e:
+              print(f"Model load/inspect fail: {str(e)}")
 
-              # Recursive function to dig into MLX's nested parameter tree
-              def extract_keys(d, prefix=""):
-                  for k, v in d.items():
-                      full_key = f"{prefix}.{k}" if prefix else k
-                      if isinstance(v, dict):
-                          extract_keys(v, full_key)
-                      else:
-                          flattened_keys.append((full_key, v))
+          print("\n=== PROBE 2: Gradient Flow via Tie-Weights ===")
+          try:
+              # We found model.embed_tokens.weight in your log. Let's trace it!
+              # Since it's 4-bit, let's see if we can perform floating point math on it.
+              w = model.model.embed_tokens.weight if hasattr(model, 'model') else model.embed_tokens.weight
+              
+              print(f"Found weight shape: {w.shape}")
+              
+              # We define a pure mathematical function to test for MLX VJP compatibility
+              def soft_target_dummy(weights):
+                  # Pretend this is our loss function operating on a slice of the head
+                  slice_w = weights[:1000, :100]
+                  return mx.mean(mx.softmax(slice_w, axis=-1))
 
-              extract_keys(nested_params)
-              print(f"Total raw parameter tensors tracked: {len(flattened_keys)}")
-              
-              print("\nSample of flattened internal parameter keys (Top 20):")
-              for k, v in flattened_keys[:20]:
-                  # Catch shape if it's an array, otherwise print the type
-                  shape_info = v.shape if hasattr(v, 'shape') else type(v)
-                  print(f" - {k} | Info: {shape_info}")
-              
-              # Searching for the projection head in the flattened keys
-              head_matches = [k for k, v in flattened_keys if "head" in k or "lm_head" in k]
-              print(f"\nKeys containing 'head' or 'lm_head': {head_matches}")
+              grad_fn = mx.value_and_grad(soft_target_dummy)
+              loss_val, grads = grad_fn(w)
+              print("-> Soft Target dummy gradient pass: SUCCESSFUL")
               
           except Exception as e:
-              print(f"FAIL in architecture reading: {str(e)}")
+              print(f"-> Soft Target dummy gradient pass failed: {str(e)}")
 
-          print("\n=== DIAGNOSTIC 3: Raw GPU Speed Benchmarking ===")
+          print("\n=== PROBE 3: Direct Forward Pass Extraction ===")
           try:
-              # Testing raw Metal speed on the runner for matrix ops
-              a = mx.random.normal((4096, 4096))
-              b = mx.random.normal((4096, 4096))
-              
-              start = time.time()
-              # Force GPU execution with eval
-              c = mx.eval(mx.matmul(a, b))
-              end = time.time()
-              print(f"4096 x 4096 MatMul on GPU took: {end - start:.4f} seconds")
+              # Let's see what the model actually outputs on a forward pass
+              prompt_tokens = mx.array([[100, 200, 300]]) # Arbitrary token IDs
+              logits = model(prompt_tokens)
+              print(f"Logits shape on forward pass: {logits.shape}")
+              print(f"Logits dtype: {logits.dtype}")
+              print("Forward pass successful.")
           except Exception as e:
-              print(f"GPU benchmark failed: {str(e)}")
-
-          print("\n=== DIAGNOSTIC 4: Quantization State Check ===")
-          try:
-              if head_matches:
-                  # Find the tensor for the first head match
-                  target_key = head_matches[0]
-                  target_tensor = next(v for k, v in flattened_keys if k == target_key)
-                  
-                  print(f"Targeting key: {target_key}")
-                  print(f"Dtype of targeted tensor: {target_tensor.dtype if hasattr(target_tensor, 'dtype') else 'N/A'}")
-                  
-                  # Check if we can run a trace on it
-                  def dummy_loss(w):
-                      return mx.mean(w)
-                  
-                  grad_fn = mx.value_and_grad(dummy_loss)
-                  val, grads = grad_fn(target_tensor)
-                  print("Gradient check on targeted head: SUCCESSFUL")
-              else:
-                  print("Skipped check because no head keys were discovered.")
-          except Exception as e:
-              print(f"Gradient check failed: {str(e)}")
+              print(f"Forward pass failed: {str(e)}")
           EOF
 
-          "${VENV_DIR}/bin/python" scripts/probe.py
+          "${VENV_DIR}/bin/python" scripts/laser_probe.py
