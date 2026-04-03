@@ -53,23 +53,27 @@ jobs:
 
           # Pre-extract student and teacher states
           t_logits_full = teacher_model(input_ids)[:, -1, :VOCAB_LIMIT]
-          student_hidden = mx.random.normal((1, 112))
+          
+          # Boost hidden state magnitude slightly to ensure gradients register
+          student_hidden = mx.random.normal((1, 112)) * 5.0 
 
           teacher_logits = mx.stop_gradient(t_logits_full)
           frozen_hidden = mx.stop_gradient(student_hidden)
 
           def compare_and_print(name, grads_a, grads_b):
-              # Check mean absolute gradient
               mean_a = mx.mean(mx.abs(grads_a[:VOCAB_LIMIT, :])).item()
               mean_b = mx.mean(mx.abs(grads_b[:VOCAB_LIMIT, :])).item()
               
               print(f"\n=== Strategy: {name} ===")
               print(f"  Soft Target Grad Mean: {mean_a:.8f}")
               print(f"  Hard Target Grad Mean: {mean_b:.8f}")
+              
               if mean_a > mean_b:
-                  print(f"  -> SUCCESS! Soft targets are {mean_a / mean_b:.2f}x denser.")
+                  print(f"  -> SUCCESS! Soft targets are {mean_a / (mean_b if mean_b > 0 else 1e-12):.2f}x denser.")
               else:
-                  print(f"  -> FAILED! Hard targets still won by {mean_b / mean_a:.2f}x.")
+                  # Safe division fallback to avoid crashing on 0
+                  safe_mean_a = mean_a if mean_a > 0 else 1e-12
+                  print(f"  -> FAILED! Hard targets still won by {mean_b / safe_mean_a:.2f}x.")
 
           # ------------------------------------------------------------------
           # STRATEGY 1: Temperature Scaling (T = 3.0)
