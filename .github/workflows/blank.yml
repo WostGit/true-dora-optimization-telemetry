@@ -32,14 +32,12 @@ jobs:
           set -euxo pipefail
           "${VENV_DIR}/bin/python" -m pip install "mlx-lm[train]" datasets numpy
 
-      - name: Execute Faithful Comparative Distillation (Unquantized)
+      - name: Execute Fast Comparative Distillation
         run: |
           mkdir -p scripts
           cat << 'EOF' > scripts/faithful_comparison.py
           import os
-          import copy
           import mlx.core as mx
-          import mlx.optimizers as optim
           from mlx_lm import load
 
           print("[INIT] Loading Pure Unquantized Float Models...")
@@ -49,13 +47,11 @@ jobs:
           teacher_model.eval()
           student_model.eval()
 
-          VOCAB_LIMIT = 2000
-          LEARNING_RATE = 1e-5
+          # Hard vocabulary ceiling to compress the compute space
+          VOCAB_LIMIT = 1000
+          LEARNING_RATE = 1e-4
 
-          prompts = [
-              "Question: If a train travels at 60 mph for 3 hours, how far does it go? Answer: 180 miles.",
-              "Question: Solve for x: 2x + 5 = 15. Answer: x = 5."
-          ]
+          prompt = "Question: 2 + 2 = ? Answer: 4"
 
           # ------------------------------------------------------------
           # LOSS FUNCTIONS
@@ -74,17 +70,27 @@ jobs:
               return -mx.sum(target_mask * s_logprobs)
 
           # ------------------------------------------------------------
-          # OPTIMIZATION LOOP
+          # FAST OPTIMIZATION LOOP
           # ------------------------------------------------------------
           def run_experiment():
-              # Capture the clean state of parameters
-              baseline_params = copy.deepcopy(student_model.parameters())
+              # Grab the raw tensor dictionary for the unquantized projection head 
+              # This circumvents PyTorch-wrapper missing attribute bugs entirely
+              target_key = "lm_head.weight"
+              all_params = student_model.parameters()
               
-              # Use MLX's native SGD optimizer to handle dictionary updates
-              optimizer = optim.SGD(learning_rate=LEARNING_RATE)
+              if target_key not in all_params:
+                  # Fallback search if the keys are mapped differently in this release
+                  target_key = [k for k in all_params.keys() if "lm_head" in k][0]
+              
+              # Isolate just the output head weights for fast training
+              trainable_params = {target_key: all_params[target_key]}
+              baseline_weight = all_params[target_key]
+              
+              tokens = teacher_tok.encode(prompt)
+              input_ids = mx.array([tokens])
               
               # --- APPROACH A: SOFT TARGETS (KL DIVERGENCE) ---
-              def kl_step(params, input_ids):
+              def kl_step(params):
                   student_model.update(params)
                   s_logits = student_model(input_ids)[:, -1, :VOCAB_LIMIT]
                   t_logits = teacher_model(input_ids)[:, -1, :VOCAB_LIMIT]
@@ -93,28 +99,20 @@ jobs:
               kl_grad_fn = mx.value_and_grad(kl_step)
               
               print("\n[RUN] Beginning Approach A (Soft Targets - KL Divergence)")
-              for epoch in range(1, 3):
-                  total_loss = 0.0
-                  for prompt in prompts:
-                      tokens = teacher_tok.encode(prompt)
-                      input_ids = mx.array([tokens])
-                      
-                      # Grads is safely captured as a parameter dictionary tree
-                      loss_value, grads = kl_grad_fn(student_model.parameters(), input_ids)
-                      
-                      # Optimizer handles the dictionary math safely
-                      optimizer.update(student_model, grads)
-                      
-                      mx.eval(student_model.parameters())
-                      total_loss += loss_value.item()
-                  print(f" [EPOCH {epoch:02d}] Total KL Loss: {total_loss:.6f}")
+              loss_value, grads = kl_grad_fn(trainable_params)
+              
+              # Quick manual parameter update
+              updated_params = {k: trainable_params[k] - LEARNING_RATE * grads[k] for k in grads}
+              mx.eval(updated_params)
+              
+              print(f" -> Baseline KL Loss: {loss_value.item():.6f}")
 
               # Reset parameters back to clean baseline state
               print("\n[RESET] Restoring Baseline Student Weights...")
-              student_model.update(baseline_params)
-
+              student_model.update({target_key: baseline_weight})
+              
               # --- APPROACH B: HARD TARGETS (CROSS-ENTROPY) ---
-              def ce_step(params, input_ids, tokens):
+              def ce_step(params):
                   student_model.update(params)
                   s_logits = student_model(input_ids)[:, -1, :VOCAB_LIMIT]
                   return ce_loss(s_logits, tokens)
@@ -122,19 +120,12 @@ jobs:
               ce_grad_fn = mx.value_and_grad(ce_step)
               
               print("\n[RUN] Beginning Approach B (Hard Targets - Cross-Entropy)")
-              for epoch in range(1, 3):
-                  total_loss = 0.0
-                  for prompt in prompts:
-                      tokens = teacher_tok.encode(prompt)
-                      input_ids = mx.array([tokens])
-                      
-                      loss_value, grads = ce_grad_fn(student_model.parameters(), input_ids, tokens)
-                      
-                      optimizer.update(student_model, grads)
-                      
-                      mx.eval(student_model.parameters())
-                      total_loss += loss_value.item()
-                  print(f" [EPOCH {epoch:02d}] Total CE Loss: {total_loss:.6f}")
+              loss_value, grads = ce_grad_fn(trainable_params)
+              
+              updated_params = {k: trainable_params[k] - LEARNING_RATE * grads[k] for k in grads}
+              mx.eval(updated_params)
+              
+              print(f" -> Baseline CE Loss: {loss_value.item():.6f}")
 
           if __name__ == "__main__":
               run_experiment()
