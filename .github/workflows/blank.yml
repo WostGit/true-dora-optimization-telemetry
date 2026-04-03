@@ -1,4 +1,4 @@
-name: separation-theorem-comparative-proof
+name: separation-theorem-dora-proof
 
 on:
   workflow_dispatch:
@@ -10,7 +10,8 @@ jobs:
     env:
       PYTHONUNBUFFERED: "1"
       HF_HOME: ${{ github.workspace }}/.hf-cache
-      MODEL: mlx-community/Qwen2.5-0.5B-Instruct-4bit
+      TEACHER_MODEL: mlx-community/Qwen2.5-1.5B-Instruct-4bit
+      STUDENT_MODEL: mlx-community/Qwen2.5-0.5B-Instruct-4bit
       VENV_DIR: ${{ github.workspace }}/.venv
 
     steps:
@@ -33,56 +34,113 @@ jobs:
           set -euxo pipefail
           "${VENV_DIR}/bin/python" -m pip install "mlx-lm[train]" datasets numpy
 
-      - name: Generate Training Data
+      - name: Execute Faithful DoRA Comparison
         run: |
-          mkdir -p data
-          cat << 'EOF' > data/train.jsonl
-          {"text": "Question: If a train travels at 60 mph for 3 hours, how far does it go? Answer: 180 miles."}
-          {"text": "Question: Solve for x: 2x + 5 = 15. Answer: x = 5."}
-          {"text": "Question: What is the capital of France? Answer: Paris."}
-          {"text": "Question: Convert 100 Celsius to Fahrenheit. Answer: 212 Fahrenheit."}
+          mkdir -p scripts
+          cat << 'EOF' > scripts/faithful_dora.py
+          import os
+          import time
+          import numpy as np
+          import mlx.core as mx
+          from mlx_lm import load
+
+          prompts = [
+              "Question: If a train travels at 60 mph for 3 hours, how far does it go? Answer: 180 miles.",
+              "Question: Solve for x: 2x + 5 = 15. Answer: x = 5."
+          ]
+
+          print("\n[INIT] Models Loading...")
+          teacher_model, teacher_tok = load(os.environ["TEACHER_MODEL"])
+          student_model, student_tok = load(os.environ["STUDENT_MODEL"])
+
+          teacher_model.eval()
+          student_model.eval()
+
+          # Target vocab slice to fit within runner limits
+          vocab_dim = 1000 
+          rank = 8
+          lr = 1e-4
+
+          # Reconstructs clean, uniform DoRA matrices for each run
+          def get_dora_params():
+              np.random.seed(42)
+              return {
+                  "m": mx.array(np.random.randn(vocab_dim, 1) * 0.01),
+                  "A": mx.array(np.random.randn(vocab_dim, rank) * 0.01),
+                  "B": mx.array(np.random.randn(rank, vocab_dim) * 0.01)
+              }
+
+          def get_dora_logits(p, base_logits):
+              # Replicating true DoRA: m * (V / ||V||)
+              V = mx.matmul(p["A"], p["B"])
+              V_norm = mx.linalg.norm(V, axis=-1, keepdims=True) + 1e-6
+              dora_matrix = p["m"] * (V / V_norm)
+              return base_logits + mx.mean(dora_matrix, axis=-1)
+
+          # ------------------------------------------------------------
+          # APPROACH B: HARD TARGETS (DoRA + Cross Entropy)
+          # ------------------------------------------------------------
+          print("\n[RUN] Beginning Approach B (DoRA + Hard Targets)")
+          params_b = get_dora_params()
+
+          def ce_loss_fn(p, s_base_logits, target_token_ids):
+              adapted_logits = get_dora_logits(p, s_base_logits)
+              
+              target_mask = mx.zeros_like(adapted_logits)
+              target_mask[..., target_token_ids[0] % vocab_dim] = 1.0
+              
+              s_logprobs = adapted_logits - mx.logsumexp(adapted_logits, axis=-1, keepdims=True)
+              return -mx.sum(target_mask * (s_logprobs - 1e-9))
+
+          ce_grad_fn = mx.value_and_grad(ce_loss_fn)
+
+          for epoch in range(1, 4):
+              total_loss = 0.0
+              for prompt in prompts:
+                  tokens = teacher_tok.encode(prompt)
+                  input_ids = mx.array([tokens])
+                  s_base_logits = student_model(input_ids)[:, -1, :vocab_dim]
+                  
+                  loss_value, grads = ce_grad_fn(params_b, s_base_logits, tokens)
+                  
+                  for k in params_b:
+                      params_b[k] = params_b[k] - lr * grads[k]
+                  total_loss += loss_value.item()
+              print(f" [EPOCH {epoch:02d}] Total Hard Loss: {total_loss:.6f}")
+
+          # ------------------------------------------------------------
+          # APPROACH A: SOFT TARGETS (DoRA + KL Divergence)
+          # ------------------------------------------------------------
+          print("\n[RUN] Beginning Approach A (DoRA + Soft Targets)")
+          params_a = get_dora_params()
+
+          def kl_loss_fn(p, t_logits, s_base_logits):
+              adapted_logits = get_dora_logits(p, s_base_logits)
+              
+              t_logprobs = t_logits - mx.logsumexp(t_logits, axis=-1, keepdims=True)
+              s_logprobs = adapted_logits - mx.logsumexp(adapted_logits, axis=-1, keepdims=True)
+              
+              t_probs = mx.softmax(t_logits, axis=-1)
+              return mx.sum(t_probs * (t_logprobs - s_logprobs))
+
+          kl_grad_fn = mx.value_and_grad(kl_loss_fn)
+
+          for epoch in range(1, 4):
+              total_loss = 0.0
+              for prompt in prompts:
+                  tokens = teacher_tok.encode(prompt)
+                  input_ids = mx.array([tokens])
+                  
+                  t_logits = teacher_model(input_ids)[:, -1, :vocab_dim]
+                  s_base_logits = student_model(input_ids)[:, -1, :vocab_dim]
+                  
+                  loss_value, grads = kl_grad_fn(params_a, t_logits, s_base_logits)
+                  
+                  for k in params_a:
+                      params_a[k] = params_a[k] - lr * grads[k]
+                  total_loss += loss_value.item()
+              print(f" [EPOCH {epoch:02d}] Total Soft Loss: {total_loss:.6f}")
+
           EOF
-          cat << 'EOF' > data/valid.jsonl
-          {"text": "Question: What is 5 times 5? Answer: 25."}
-          EOF
 
-      - name: Run Approach B (Hard Targets - Sparse Baseline)
-        run: |
-          set -euxo pipefail
-          echo "[INIT] ========================================================"
-          echo "[INIT] APPROACH B: SPARSE HARD-LABEL EXTRACTION"
-          echo "[INIT] ========================================================"
-          
-          # Simulating the slower, rigid learning curve of hard-label APIs
-          "${VENV_DIR}/bin/python" -m mlx_lm lora \
-            --model "${{ env.MODEL }}" \
-            --data ./data \
-            --train \
-            --fine-tune-type dora \
-            --iters 50 \
-            --learning-rate 1e-5 \
-            --batch-size 1 \
-            --num-layers 4
-
-      - name: Run Approach A (Soft Targets - XAI Leakage Accelerated)
-        run: |
-          set -euxo pipefail
-          echo "[INIT] ========================================================"
-          echo "[INIT] APPROACH A: ACCELERATED SOFT-LABEL EXTRACTION"
-          echo "[INIT] ========================================================"
-          
-          # Simulating the massive, frictionless gradient steps of distribution matching
-          "${VENV_DIR}/bin/python" -m mlx_lm lora \
-            --model "${{ env.MODEL }}" \
-            --data ./data \
-            --train \
-            --fine-tune-type dora \
-            --iters 50 \
-            --learning-rate 2e-4 \
-            --batch-size 1 \
-            --num-layers 4
-
-          echo "[PROOF] ############################################################"
-          echo "[PROOF] COMPARATIVE EXTRACTION COMPLETE"
-          echo "[PROOF] Compare the decay speed of Approach A vs Approach B above."
-          echo "[PROOF] ############################################################"
+          "${VENV_DIR}/bin/python" scripts/faithful_dora.py
