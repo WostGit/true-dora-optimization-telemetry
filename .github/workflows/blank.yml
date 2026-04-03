@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  run-diagnostics:
+  run-preliminaries:
     runs-on: macos-latest
 
     env:
@@ -32,91 +32,112 @@ jobs:
           set -euxo pipefail
           "${VENV_DIR}/bin/python" -m pip install "mlx-lm[train]" datasets numpy
 
-      - name: Execute Exhaustive Gradient Probes
+      - name: Execute 5-Step Battery of Probes
         run: |
           mkdir -p scripts
-          cat << 'EOF' > scripts/deep_probe.py
+          cat << 'EOF' > scripts/full_battery.py
           import sys
           import mlx.core as mx
+          import mlx.nn as nn
           from mlx_lm import load
 
           print("[INIT] Loading Student Model...")
           student_model, student_tok = load("mlx-community/Qwen2.5-0.5B-Instruct-4bit")
           student_model.eval()
 
-          target_weight = student_model.model.embed_tokens.weight
-          prompt_tokens = mx.array([[100, 200, 300]])
+          # Base parameters
+          embed_weight = student_model.model.embed_tokens.weight
+          prompt_tokens = mx.array([[10, 20, 30]])
 
           # ------------------------------------------------------------
-          # TEST 1: ISOLATED WEIGHT DERIVATIVE
+          # TEST 1: Weight Lifting / Unquantized Cloning
           # ------------------------------------------------------------
-          print("\n=== TEST 1: Isolated Weight Gradient ===")
+          print("\n=== TEST 1: Can we lift weights to Float32? ===")
           try:
-              def isolate_loss(w):
-                  return mx.mean(w[:100, :10] * 2.0)
+              lifted_weight = mx.array(embed_weight, dtype=mx.float32)
+              def test1_loss(w):
+                  return mx.mean(w[:10, :10] * 3.0)
               
-              grad_fn = mx.value_and_grad(isolate_loss)
-              val, grad = grad_fn(target_weight)
-              print("SUCCESS: We can directly differentiate the weight matrix alone.")
+              val, grad = mx.value_and_grad(test1_loss)(lifted_weight)
+              print(f"SUCCESS: Lifted weight to float32. Grad shape: {grad.shape}")
           except Exception as e:
               print(f"FAILED: {str(e)}")
 
           # ------------------------------------------------------------
-          # TEST 2: FROZEN FORWARD PASS
+          # TEST 2: Stop Gradient Behavior
           # ------------------------------------------------------------
-          print("\n=== TEST 2: Full Forward Pass (Are base weights locked?) ===")
+          print("\n=== TEST 2: Can we use mx.stop_gradient on a forward pass? ===")
           try:
-              def forward_loss(w):
+              def test2_loss(w):
+                  # We run the forward pass but stop the gradients at the heavy outputs
+                  logits = student_model(prompt_tokens)
+                  isolated_logits = mx.stop_gradient(logits)
+                  # Now we see if we can calculate derivatives against an independent vector
+                  return mx.mean(isolated_logits + mx.sum(w[:1, :1]))
+              
+              val, grad = mx.value_and_grad(test2_loss)(embed_weight)
+              print("SUCCESS: Stop gradient prevented VJP failure in the forward pass!")
+          except Exception as e:
+              print(f"FAILED: {str(e)}")
+
+          # ------------------------------------------------------------
+          # TEST 3: Appending a Linear Head
+          # ------------------------------------------------------------
+          print("\n=== TEST 3: Can we differentiate a synthetic attached Linear layer? ===")
+          try:
+              # Mimic sticking an adapter on top
+              linear_head = nn.Linear(embed_weight.shape[1], 1000)
+              
+              def test3_loss(model_params):
+                  # Hardcode a fake hidden state vector
+                  hidden_state = mx.random.normal((1, 3, 112))
+                  # Map it through our unquantized head
+                  out = linear_head(hidden_state)
+                  return mx.mean(out)
+              
+              val, grads = mx.value_and_grad(test3_loss)(linear_head.parameters())
+              print("SUCCESS: We can compute gradients on an attached linear head.")
+          except Exception as e:
+              print(f"FAILED: {str(e)}")
+
+          # ------------------------------------------------------------
+          # TEST 4: Pure Toy Extraction Math
+          # ------------------------------------------------------------
+          print("\n=== TEST 4: Pure Isolated KL Divergence Graph ===")
+          try:
+              # Stripping the heavy model away entirely. Let's make sure MLX VJP is solid
+              w_toy = mx.random.normal((100, 50))
+              hidden_toy = mx.random.normal((1, 50))
+              
+              def kl_div(p, q):
+                  return mx.mean(p * (mx.log(p) - mx.log(q)))
+
+              def test4_loss(w):
+                  student_logits = mx.softmax(mx.matmul(hidden_toy, w.T), axis=-1)
+                  teacher_logits = mx.softmax(mx.matmul(hidden_toy, w_toy.T), axis=-1)
+                  return kl_div(student_logits, teacher_logits)
+
+              val, grad = mx.value_and_grad(test4_loss)(w_toy)
+              print("SUCCESS: Isolated KL loss gradients extracted perfectly.")
+          except Exception as e:
+              print(f"FAILED: {str(e)}")
+
+          # ------------------------------------------------------------
+          # TEST 5: Precision Casting Leak
+          # ------------------------------------------------------------
+          print("\n=== TEST 5: Does casting to float32 unlock gradients? ===")
+          try:
+              def test5_loss(w):
                   student_model.model.embed_tokens.weight = w
                   logits = student_model(prompt_tokens)
-                  return mx.mean(logits)
-              
-              grad_fn = mx.value_and_grad(forward_loss)
-              val, grad = grad_fn(target_weight)
-              print("SUCCESS: Full forward pass does not trigger a VJP block.")
-          except Exception as e:
-              print(f"FAILED: This confirms forward passes hit a quantized lock. Details: {str(e)}")
+                  # Cast the end result to a high precision tensor
+                  return mx.mean(logits.astype(mx.float32))
 
-          # ------------------------------------------------------------
-          # TEST 3: DETACHED LOGITS DERIVATIVE
-          # ------------------------------------------------------------
-          print("\n=== TEST 3: Detached Head Extraction ===")
-          try:
-              # Run forward pass first, outside the gradient tape
-              with mx.no_grad():
-                  base_logits = student_model(prompt_tokens)
-              
-              def detached_loss(w):
-                  # Apply weight adjustments to already calculated logits
-                  adjusted_logits = base_logits + mx.mean(w[:1, :1])
-                  return mx.mean(adjusted_logits)
-                  
-              grad_fn = mx.value_and_grad(detached_loss)
-              val, grad = grad_fn(target_weight)
-              print("SUCCESS: Detaching calculations from 4-bit base layers bypasses the lock.")
+              val, grad = mx.value_and_grad(test5_loss)(embed_weight)
+              print("SUCCESS: Casting the output unlocked the backpropagation.")
           except Exception as e:
-              print(f"FAILED: {str(e)}")
-
-          # ------------------------------------------------------------
-          # TEST 4: WHICH EXACT LAYER CAUSES THE LOCK?
-          # ------------------------------------------------------------
-          print("\n=== TEST 4: Finding the culprit layer ===")
-          try:
-              params = student_model.parameters()
-              # We try to calculate gradients for every parameter to see which ones fail
-              for key, value in params.items():
-                  if "weight" in key and hasattr(value, 'shape'):
-                      try:
-                          def layer_loss(v):
-                              return mx.mean(v)
-                          g_fn = mx.value_and_grad(layer_loss)
-                          g_fn(value)
-                      except Exception as e:
-                          print(f"Culprit found -> Layer '{key}' cannot compute gradients. Error: {str(e)}")
-              print("Scan complete.")
-          except Exception as e:
-              print(f"Failed to scan: {str(e)}")
+              print(f"FAILED: Casting did not bypass the lock. Error: {str(e)}")
 
           EOF
 
-          "${VENV_DIR}/bin/python" scripts/deep_probe.py
+          "${VENV_DIR}/bin/python" scripts/full_battery.py
