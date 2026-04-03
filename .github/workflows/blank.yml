@@ -1,4 +1,4 @@
-name: separation-theorem-16bit-unquantized-proof
+name: adversarial-blackbox-distillation-proof
 
 on:
   workflow_dispatch:
@@ -32,104 +32,100 @@ jobs:
           set -euxo pipefail
           "${VENV_DIR}/bin/python" -m pip install "mlx-lm[train]" datasets numpy
 
-      - name: Execute Verbose Proof
+      - name: Execute Distillation Attack Simulation
         run: |
           mkdir -p scripts
-          cat << 'EOF' > scripts/verbose_proof.py
+          cat << 'EOF' > scripts/attack_proof.py
           import mlx.core as mx
           from mlx_lm import load
 
-          print("[INIT] Loading 16-bit Float Models...")
-          teacher_model, _ = load("mlx-community/Qwen2.5-1.5B-Instruct-bf16")
+          print("[INIT] Loading Models for Adversarial Distillation...")
+          teacher_model, teacher_tok = load("mlx-community/Qwen2.5-1.5B-Instruct-bf16")
           student_model, student_tok = load("mlx-community/Qwen2.5-0.5B-Instruct-bf16")
 
           teacher_model.eval()
-          student_model.train() 
+          student_model.train()
 
-          VOCAB_LIMIT = 500  # Narrowed limit to make verbose printing readable
-          tokens = student_tok.encode("The quick brown fox jumps over")
-          input_ids = mx.array([tokens])
+          # 1. Simulate the "Attack Prompts" documented by Anthropic
+          # They targeted: Agentic reasoning, Chain-of-Thought (CoT), and formatting.
+          attack_queries = [
+              "Solve this logic puzzle and explain your reasoning step-by-step: If all flubs are glubs, and some glubs are blubs, are all flubs blubs?",
+              "Generate a detailed grading rubric for evaluating a Python coding agent.",
+              "Rewrite the following statement to remove any potential political bias or censorship flags."
+          ]
 
-          # Target label extraction
-          target_id = tokens[0] % VOCAB_LIMIT
+          print("\n=== STEP 1: EXTRUDING TEACHER KNOWLEDGE (The Attack) ===")
+          distillation_dataset = []
 
-          print("\n=== INPUT VERBOSE METRICS ===")
-          print(f"Prompt Tokens: {tokens}")
-          print(f"Hard Target Token ID mapped to vocab slice: {target_id}")
+          for query in attack_queries:
+              # We use a standard generation loop to get the raw text (the only thing attackers have access to)
+              prompt_tokens = mx.array([teacher_tok.encode(query)])
+              
+              # Simple greedy generation to simulate API output
+              output_tokens = []
+              current_input = prompt_tokens
+              
+              for _ in range(50):  # Generate 50 tokens of CoT or text
+                  logits = teacher_model(current_input)[:, -1, :]
+                  next_token = mx.argmax(logits, axis=-1)
+                  output_tokens.append(next_token.item())
+                  current_input = mx.concatenate([current_input, next_token[None, :]], axis=1)
+                  
+              decoded_response = teacher_tok.decode(output_tokens)
+              print(f"\n[Query]: {query}")
+              print(f"[Claude-Equivalent Response]: {decoded_response[:100]}...")
+              
+              distillation_dataset.append((query, decoded_response))
 
-          # 1. Forward pass for frozen teacher logits
-          t_logits = teacher_model(input_ids)[:, -1, :VOCAB_LIMIT]
-          teacher_logits = mx.stop_gradient(t_logits)
+          # 2. Simulate training the student on extracted text (The mimicry)
+          print("\n=== STEP 2: MEASURING STUDENT GRADIENT PULL ===")
 
-          print("\n=== TEACHER LOGITS DISTRIBUTION ===")
-          print(f"Teacher Logits Shape: {teacher_logits.shape}")
-          print(f"Teacher Logits Max: {mx.max(teacher_logits).item():.4f}")
-          print(f"Teacher Logits Min: {mx.min(teacher_logits).item():.4f}")
-          print(f"Teacher Logits Mean: {mx.mean(teacher_logits).item():.4f}")
-          
-          t_probs = mx.softmax(teacher_logits, axis=-1)
-          print(f"Teacher Probabilities (Top 5): {mx.sort(t_probs)[..., -5:].tolist()}")
+          def attack_loss(p):
+              student_model.update(p)
+              total_loss = 0.0
+              
+              # Attackers simply train the student to predict the teacher's exact text
+              for query, response in distillation_dataset:
+                  full_text = query + response
+                  tokens = mx.array([student_tok.encode(full_text)])
+                  
+                  # Standard causal language modeling loss (predict the next token)
+                  logits = student_model(tokens)[:, :-1, :]
+                  targets = tokens[:, 1:]
+                  
+                  # Flatten for cross-entropy
+                  logits = mx.reshape(logits, (-1, logits.shape[-1]))
+                  targets = mx.reshape(targets, (-1,))
+                  
+                  # Compute standard CE loss
+                  logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+                  selected_logprobs = mx.take_along_axis(logprobs, targets[:, None], axis=-1)
+                  total_loss += -mx.mean(selected_logprobs)
+                  
+              return total_loss / len(distillation_dataset)
 
-          def extract_verbose_grad(grads, name="Gradients"):
+          # Calculate the raw gradients of the attack!
+          params = student_model.parameters()
+          grads = mx.grad(attack_loss)(params)
+
+          # Measure the density
+          def extract_mean_grad(g_dict):
               total_abs_sum = 0.0
               total_count = 0
-              flat_samples = []
-              
               def traverse(g):
-                  nonlocal total_abs_sum, total_count, flat_samples
+                  nonlocal total_abs_sum, total_count
                   if isinstance(g, dict):
-                      for k, v in g.items():
-                          traverse(v)
+                      for k, v in g.items(): traverse(v)
                   elif isinstance(g, mx.array):
                       total_abs_sum += mx.sum(mx.abs(g)).item()
                       total_count += g.size
-                      if len(flat_samples) < 5:
-                          flat_samples.extend(g.flatten()[:5].tolist())
-              
-              traverse(grads)
-              mean_val = total_abs_sum / total_count if total_count > 0 else 0.0
-              
-              print(f"\n[{name}]")
-              print(f"  Mean Abs Value: {mean_val:.8f}")
-              print(f"  Sample values (first 5 found): {[f'{x:.8f}' for x in flat_samples[:5]]}")
-              return mean_val
+              traverse(g_dict)
+              return total_abs_sum / total_count if total_count > 0 else 0.0
 
-          def kl_loss(s_logits, t_logits):
-              t_probs = mx.softmax(t_logits, axis=-1)
-              s_logprobs = s_logits - mx.logsumexp(s_logits, axis=-1, keepdims=True)
-              return mx.mean(mx.sum(t_probs * -s_logprobs, axis=-1))
-
-          def ce_loss(s_logits):
-              s_logprobs = s_logits - mx.logsumexp(s_logits, axis=-1, keepdims=True)
-              return -s_logprobs[..., target_id].mean()
-
-          params = student_model.parameters()
-
-          # --- RUN AND INSPECT ---
-
-          # A. RUNNING HARD TARGET TRACE
-          student_model.update(params)
-          s_logits_hard = student_model(input_ids)[:, -1, :VOCAB_LIMIT]
-          
-          print("\n=== STUDENT LOGITS BEFORE LOSS ===")
-          print(f"Student Logits Max: {mx.max(s_logits_hard).item():.4f}")
-          print(f"Student Logits Min: {mx.min(s_logits_hard).item():.4f}")
-
-          def opt_hard(p):
-              student_model.update(p)
-              return ce_loss(student_model(input_ids)[:, -1, :VOCAB_LIMIT])
-
-          grads_hard = mx.grad(opt_hard)(params)
-          extract_verbose_grad(grads_hard, name="HARD TARGET GRADIENTS")
-
-          # B. RUNNING SOFT TARGET TRACE
-          def opt_soft(p):
-              student_model.update(p)
-              return kl_loss(student_model(input_ids)[:, -1, :VOCAB_LIMIT], teacher_logits)
-
-          grads_soft = mx.grad(opt_soft)(params)
-          extract_verbose_grad(grads_soft, name="SOFT TARGET GRADIENTS")
+          attack_gradient_density = extract_mean_grad(grads)
+          print(f"\n=== ATTACK COMPLETE ===")
+          print(f"Mean Adversarial Gradient Density: {attack_gradient_density:.8f}")
 
           EOF
 
-          "${VENV_DIR}/bin/python" scripts/verbose_proof.py
+          "${VENV_DIR}/bin/python" scripts/attack_proof.py
