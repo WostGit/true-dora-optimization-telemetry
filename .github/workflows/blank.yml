@@ -93,7 +93,11 @@ jobs:
           B = mx.array(np.random.randn(rank, in_dim))
 
           lr = 0.01 # Attacker Learning Rate
-          print(f"[INIT] Attack compiled. Parameter norms: ||m||={mx.norm(m).item():.3f}, ||A||={mx.norm(A).item():.3f}")
+          
+          # FIX: Access norm via mx.linalg.norm instead of mx.norm
+          m_norm = mx.linalg.norm(m).item()
+          A_norm = mx.linalg.norm(A).item()
+          print(f"[INIT] Attack compiled. Parameter norms: ||m||={m_norm:.3f}, ||A||={A_norm:.3f}")
 
           # ------------------------------------------------------------
           # THE OPTIMIZATION LOOP
@@ -143,10 +147,15 @@ jobs:
                   m = m - lr * grad_m
                   A = A - lr * grad_A
                   
-                  print(f"  [PROBE {i+1:02d}] Current D_KL: {kl_div.item():.6f} | Norm of Grad_m: {mx.norm(grad_m).item():.6f}")
+                  # FIX: Access norm via mx.linalg.norm
+                  grad_m_norm = mx.linalg.norm(grad_m).item()
+                  print(f"  [PROBE {i+1:02d}] Current D_KL: {kl_div.item():.6f} | Norm of Grad_m: {grad_m_norm:.6f}")
 
+              # FIX: Access norm via mx.linalg.norm
+              m_norm_ep = mx.linalg.norm(m).item()
+              A_norm_ep = mx.linalg.norm(A).item()
               print(f"[EPOCH {epoch:02d}] Complete. Total Batch KL: {epoch_kl:.6f}")
-              print(f"[EPOCH {epoch:02d}] Updated Parameter norms: ||m||={mx.norm(m).item():.4f}, ||A||={mx.norm(A).item():.4f}")
+              print(f"[EPOCH {epoch:02d}] Updated Parameter norms: ||m||={m_norm_ep:.4f}, ||A||={A_norm_ep:.4f}")
 
           print("\n[PROOF] ############################################################")
           print("[PROOF] DORA EXTRACTION COMPLETE")
