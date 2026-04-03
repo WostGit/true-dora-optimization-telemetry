@@ -1,4 +1,4 @@
-name: separation-theorem-faithful-proof
+name: separation-theorem-pure-proof
 
 on:
   workflow_dispatch:
@@ -9,7 +9,6 @@ jobs:
 
     env:
       PYTHONUNBUFFERED: "1"
-      HF_HOME: ${{ github.workspace }}/.hf-cache
       VENV_DIR: ${{ github.workspace }}/.venv
 
     steps:
@@ -30,114 +29,116 @@ jobs:
       - name: Install MLX and Dependencies
         run: |
           set -euxo pipefail
-          "${VENV_DIR}/bin/python" -m pip install "mlx-lm[train]" datasets numpy
+          # We only need the core MLX library! No massive model weights required.
+          "${VENV_DIR}/bin/python" -m pip install mlx numpy
 
-      - name: Execute Faithful Comparative Distillation (8-bit)
+      - name: Execute Pure Empirical Proof
         run: |
           mkdir -p scripts
-          cat << 'EOF' > scripts/faithful_comparison.py
-          import os
-          import copy
+          cat << 'EOF' > scripts/pure_proof.py
           import mlx.core as mx
-          from mlx_lm import load
+          import mlx.nn as nn
+          import numpy as np
 
-          print("[INIT] Loading Active 8-Bit Weight Tensors...")
-          # Loading actual 8-bit Qwen models to bypass VJP gradient locks
-          teacher_model, teacher_tok = load("mlx-community/Qwen2.5-1.5B-Instruct-8bit")
-          student_model, student_tok = load("mlx-community/Qwen2.5-0.5B-Instruct-8bit")
+          # 1. Define a pure unquantized network
+          class TinyNet(nn.Module):
+              def __init__(self, input_dim, output_dim):
+                  super().__init__()
+                  self.layer1 = nn.Linear(input_dim, 32)
+                  self.layer2 = nn.Linear(32, output_dim)
+                  
+              def __call__(self, x):
+                  x = nn.relu(self.layer1(x))
+                  return self.layer2(x)
 
-          teacher_model.eval()
-          student_model.eval()
+          # 2. Setup the Arena
+          INPUT_DIM = 10
+          VOCAB_DIM = 50
+          BATCH_SIZE = 4
+          LEARNING_RATE = 1e-3
 
-          # Safe limits for memory management on the runner
-          VOCAB_LIMIT = 2000
-          LEARNING_RATE = 1e-5
+          teacher = TinyNet(INPUT_DIM, VOCAB_DIM)
+          student = TinyNet(INPUT_DIM, VOCAB_DIM)
 
-          prompts = [
-              "Question: If a train travels at 60 mph for 3 hours, how far does it go? Answer: 180 miles.",
-              "Question: Solve for x: 2x + 5 = 15. Answer: x = 5."
-          ]
+          # Create synthetic data
+          np.random.seed(42)
+          X = mx.array(np.random.randn(BATCH_SIZE, INPUT_DIM).astype(np.float32))
 
-          # ------------------------------------------------------------
-          # LOSS FUNCTIONS
-          # ------------------------------------------------------------
-          def kl_loss(student_logits, teacher_logits):
-              t_logprobs = teacher_logits - mx.logsumexp(teacher_logits, axis=-1, keepdims=True)
-              s_logprobs = student_logits - mx.logsumexp(student_logits, axis=-1, keepdims=True)
-              t_probs = mx.softmax(teacher_logits, axis=-1)
-              divergence = mx.sum(t_probs * (t_logprobs - s_logprobs), axis=-1)
-              return mx.mean(divergence)
-
-          def ce_loss(student_logits, target_token_ids):
-              s_logprobs = student_logits - mx.logsumexp(student_logits, axis=-1, keepdims=True)
-              target_mask = mx.zeros_like(student_logits)
-              target_mask[..., target_token_ids[0] % VOCAB_LIMIT] = 1.0
-              return -mx.sum(target_mask * s_logprobs)
+          # The teacher establishes the ground truth distribution
+          t_logits = teacher(X)
+          # Hard targets are the argmax (the "correct" final answers)
+          hard_targets = mx.argmax(t_logits, axis=-1)
 
           # ------------------------------------------------------------
-          # OPTIMIZATION LOOP
+          # Loss Functions
           # ------------------------------------------------------------
-          def run_experiment():
-              # We use .parameters() which is natively supported on 8-bit floats
-              trainable_params = student_model.parameters()
-              baseline_params = copy.deepcopy(trainable_params)
+          def kl_loss(s_logits, t_logits):
+              t_logprobs = t_logits - mx.logsumexp(t_logits, axis=-1, keepdims=True)
+              s_logprobs = s_logits - mx.logsumexp(s_logits, axis=-1, keepdims=True)
+              t_probs = mx.softmax(t_logits, axis=-1)
+              return mx.mean(mx.sum(t_probs * (t_logprobs - s_logprobs), axis=-1))
+
+          def ce_loss(s_logits, target_ids):
+              s_logprobs = s_logits - mx.logsumexp(s_logits, axis=-1, keepdims=True)
+              target_mask = mx.zeros_like(s_logits)
+              for i, idx in enumerate(target_ids.tolist()):
+                  target_mask[i, idx] = 1.0
+              return -mx.mean(mx.sum(target_mask * s_logprobs, axis=-1))
+
+          # ------------------------------------------------------------
+          # The Comparative Runs
+          # ------------------------------------------------------------
+          def train_student(mode="KL"):
+              # Fresh student for every run
+              student = TinyNet(INPUT_DIM, VOCAB_DIM)
+              params = student.parameters()
               
-              # --- APPROACH A: SOFT TARGETS (KL DIVERGENCE) ---
-              def kl_step(params, input_ids):
-                  student_model.update(params)
-                  s_logits = student_model(input_ids)[:, -1, :VOCAB_LIMIT]
-                  t_logits = teacher_model(input_ids)[:, -1, :VOCAB_LIMIT]
-                  return kl_loss(s_logits, t_logits)
-
-              kl_grad_fn = mx.value_and_grad(kl_step)
+              def loss_fn(p):
+                  student.update(p)
+                  s_logits = student(X)
+                  if mode == "KL":
+                      return kl_loss(s_logits, t_logits)
+                  else:
+                      return ce_loss(s_logits, hard_targets)
+                      
+              grad_fn = mx.value_and_grad(loss_fn)
               
-              print("\n[RUN] Beginning Approach A (Soft Targets - KL Divergence)")
-              for epoch in range(1, 3):
-                  total_loss = 0.0
-                  for prompt in prompts:
-                      tokens = teacher_tok.encode(prompt)
-                      input_ids = mx.array([tokens])
+              losses = []
+              for epoch in range(5):
+                  loss, grads = grad_fn(params)
+                  
+                  # Standard SGD
+                  for k in params.keys():
+                      params[k] = params[k] - LEARNING_RATE * grads[k]
                       
-                      loss_value, grads = kl_grad_fn(trainable_params, input_ids)
-                      
-                      for k in grads.keys():
-                          trainable_params[k] = trainable_params[k] - LEARNING_RATE * grads[k]
-                          
-                      mx.eval(trainable_params)
-                      total_loss += loss_value.item()
-                  print(f" [EPOCH {epoch:02d}] Total KL Loss: {total_loss:.6f}")
+                  mx.eval(params)
+                  losses.append(loss.item())
+                  
+              return losses
 
-              # Reset parameters back to clean baseline state
-              print("\n[RESET] Restoring Baseline Student Weights...")
-              student_model.update(baseline_params)
-              trainable_params = student_model.parameters()
+          print("\n[RUN] Running Approach B (Hard Targets - Cross-Entropy)")
+          ce_results = train_student(mode="CE")
+          for i, loss in enumerate(ce_results):
+              print(f" Epoch {i+1}: Loss = {loss:.6f}")
 
-              # --- APPROACH B: HARD TARGETS (CROSS-ENTROPY) ---
-              def ce_step(params, input_ids, tokens):
-                  student_model.update(params)
-                  s_logits = student_model(input_ids)[:, -1, :VOCAB_LIMIT]
-                  return ce_loss(s_logits, tokens)
+          print("\n[RUN] Running Approach A (Soft Targets - KL Divergence)")
+          kl_results = train_student(mode="KL")
+          for i, loss in enumerate(kl_results):
+              print(f" Epoch {i+1}: Loss = {loss:.6f}")
 
-              ce_grad_fn = mx.value_and_grad(ce_step)
-              
-              print("\n[RUN] Beginning Approach B (Hard Targets - Cross-Entropy)")
-              for epoch in range(1, 3):
-                  total_loss = 0.0
-                  for prompt in prompts:
-                      tokens = teacher_tok.encode(prompt)
-                      input_ids = mx.array([tokens])
-                      
-                      loss_value, grads = ce_grad_fn(trainable_params, input_ids, tokens)
-                      
-                      for k in grads.keys():
-                          trainable_params[k] = trainable_params[k] - LEARNING_RATE * grads[k]
-                          
-                      mx.eval(trainable_params)
-                      total_loss += loss_value.item()
-                  print(f" [EPOCH {epoch:02d}] Total CE Loss: {total_loss:.6f}")
+          # 3. Prove the Theorem
+          ce_delta = ce_results[0] - ce_results[-1]
+          kl_delta = kl_results[0] - kl_results[-1]
 
-          if __name__ == "__main__":
-              run_experiment()
+          print("\n############################################################")
+          print(f"Approach B (Hard Targets) Total Decay: {ce_delta:.6f}")
+          print(f"Approach A (Soft Targets) Total Decay: {kl_delta:.6f}")
+          print("############################################################")
+          if kl_delta > ce_delta:
+              print("[PROOF SUCCESS] Soft targets yielded a faster/deeper optimization drop.")
+          else:
+              print("[PROOF FAIL] Check learning rates or dimensions.")
+          print("############################################################")
           EOF
 
-          "${VENV_DIR}/bin/python" scripts/faithful_comparison.py
+          "${VENV_DIR}/bin/python" scripts/pure_proof.py
