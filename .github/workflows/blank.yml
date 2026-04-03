@@ -40,7 +40,6 @@ jobs:
           import copy
           import mlx.core as mx
           from mlx_lm import load
-          from mlx_lm.tuner import linear_to_lora
 
           print("[INIT] Loading Active Weight Tensors...")
           # Loading actual Qwen models
@@ -50,9 +49,7 @@ jobs:
           teacher_model.eval()
           student_model.eval()
 
-          # Convert student layers to LoRA to enable gradient computation on floats
-          linear_to_lora(student_model, num_layers=4, rank=8)
-
+          # To keep the action runner's memory safe and fast
           VOCAB_LIMIT = 2000
           LEARNING_RATE = 1e-4
 
@@ -81,13 +78,13 @@ jobs:
           # OPTIMIZATION LOOP
           # ------------------------------------------------------------
           def run_experiment():
-              # Target only the newly introduced trainable LoRA adapter weights
-              trainable_params = student_model.trainable_parameters()
+              # FOCUS ON LM_HEAD: This bypasses quantized weight gradient errors entirely!
+              trainable_params = student_model.lm_head.parameters()
               baseline_params = copy.deepcopy(trainable_params)
               
               # --- APPROACH A: SOFT TARGETS (KL DIVERGENCE) ---
               def kl_step(params, input_ids):
-                  student_model.update(params)
+                  student_model.lm_head.update(params)
                   s_logits = student_model(input_ids)[:, -1, :VOCAB_LIMIT]
                   t_logits = teacher_model(input_ids)[:, -1, :VOCAB_LIMIT]
                   return kl_loss(s_logits, t_logits)
@@ -103,7 +100,7 @@ jobs:
                       
                       loss_value, grads = kl_grad_fn(trainable_params, input_ids)
                       
-                      # Map gradients only to the active float adapters
+                      # Map gradients only to the active float weights
                       for k in grads.keys():
                           trainable_params[k] = trainable_params[k] - LEARNING_RATE * grads[k]
                           
@@ -113,12 +110,12 @@ jobs:
 
               # Reset parameters back to clean baseline state
               print("\n[RESET] Restoring Baseline Student Weights...")
-              student_model.update(baseline_params)
-              trainable_params = student_model.trainable_parameters()
+              student_model.lm_head.update(baseline_params)
+              trainable_params = student_model.lm_head.parameters()
 
               # --- APPROACH B: HARD TARGETS (CROSS-ENTROPY) ---
               def ce_step(params, input_ids, tokens):
-                  student_model.update(params)
+                  student_model.lm_head.update(params)
                   s_logits = student_model(input_ids)[:, -1, :VOCAB_LIMIT]
                   return ce_loss(s_logits, tokens)
 
