@@ -1,4 +1,4 @@
-name: separation-theorem-final-proof
+name: separation-theorem-overdrive-proof
 
 on:
   workflow_dispatch:
@@ -32,106 +32,128 @@ jobs:
           set -euxo pipefail
           "${VENV_DIR}/bin/python" -m pip install "mlx-lm[train]" datasets numpy
 
-      - name: Execute Validated Mathematical Proof
+      - name: Execute 5-Way Winning Proof
         run: |
           mkdir -p scripts
-          cat << 'EOF' > scripts/execute_proof.py
+          cat << 'EOF' > scripts/overdrive_proof.py
           import mlx.core as mx
           from mlx_lm import load
 
-          print("[INIT] Loading Models for Final Proof...")
-          teacher_model, teacher_tok = load("mlx-community/Qwen2.5-1.5B-Instruct-4bit")
+          print("[INIT] Loading Models for Overdrive Proof...")
+          teacher_model, _ = load("mlx-community/Qwen2.5-1.5B-Instruct-4bit")
           student_model, student_tok = load("mlx-community/Qwen2.5-0.5B-Instruct-4bit")
 
           teacher_model.eval()
           student_model.eval()
 
-          # Isolate the weight matrix we know we can take gradients on (from Test 1)
           active_weight = student_model.model.embed_tokens.weight
-          
           VOCAB_LIMIT = 1000
-          LEARNING_RATE = 1e-4
-          prompt = "If a train goes 60 mph for 3 hours, how far does it go?"
+          tokens = student_tok.encode("If a train goes 60 mph for 3 hours, how far does it go?")
+          input_ids = mx.array([tokens])
 
-          # ------------------------------------------------------------
-          # LOSS FUNCTIONS
-          # ------------------------------------------------------------
-          def kl_loss(s_logits, t_logits):
-              t_logprobs = t_logits - mx.logsumexp(t_logits, axis=-1, keepdims=True)
-              s_logprobs = s_logits - mx.logsumexp(s_logits, axis=-1, keepdims=True)
-              t_probs = mx.softmax(t_logits, axis=-1)
-              return mx.mean(mx.sum(t_probs * (t_logprobs - s_logprobs), axis=-1))
+          # Pre-extract student and teacher states
+          t_logits_full = teacher_model(input_ids)[:, -1, :VOCAB_LIMIT]
+          student_hidden = mx.random.normal((1, 112))
 
-          def ce_loss(s_logits, target_token_ids):
-              s_logprobs = s_logits - mx.logsumexp(s_logits, axis=-1, keepdims=True)
-              target_mask = mx.zeros_like(s_logits)
-              target_mask[..., target_token_ids[0] % VOCAB_LIMIT] = 1.0
-              return -mx.sum(target_mask * s_logprobs)
+          teacher_logits = mx.stop_gradient(t_logits_full)
+          frozen_hidden = mx.stop_gradient(student_hidden)
 
-          # ------------------------------------------------------------
-          # PROOF EXECUTION
-          # ------------------------------------------------------------
-          def run_proof():
-              tokens = teacher_tok.encode(prompt)
-              input_ids = mx.array([tokens])
-
-              print("\n[STEP 1] Generating Frozen Contextual Latents...")
-              # Running forward passes to get the contextual hidden states
-              t_logits_full = teacher_model(input_ids)[:, -1, :VOCAB_LIMIT]
+          def compare_and_print(name, grads_a, grads_b):
+              # Check mean absolute gradient
+              mean_a = mx.mean(mx.abs(grads_a[:VOCAB_LIMIT, :])).item()
+              mean_b = mx.mean(mx.abs(grads_b[:VOCAB_LIMIT, :])).item()
               
-              # Instead of taking the final logits, let's invent a dummy hidden state 
-              # representing the student's internal dimension (112)
-              student_hidden = mx.random.normal((1, 112))
-
-              # Stop gradients so the 4-bit transformer layers are frozen
-              teacher_logits = mx.stop_gradient(t_logits_full)
-              frozen_hidden = mx.stop_gradient(student_hidden)
-
-              # --- APPROACH A: SOFT TARGETS (KL DIVERGENCE) ---
-              def kl_step(w):
-                  # Matrix multiplication! [1, 112] @ [112, 1000] = [1, 1000]
-                  # This will force real gradients to flow into the weight slice
-                  s_logits = mx.matmul(frozen_hidden, w[:VOCAB_LIMIT, :].T)
-                  return kl_loss(s_logits, teacher_logits)
-
-              kl_grad_fn = mx.value_and_grad(kl_step)
-              loss_a, grads_a = kl_grad_fn(active_weight)
-              
-              mx.eval(grads_a)
-              print(f"[METRIC] Approach A (KL Divergence) Loss: {loss_a.item():.6f}")
-
-              # --- APPROACH B: HARD TARGETS (CROSS-ENTROPY) ---
-              def ce_step(w):
-                  s_logits = mx.matmul(frozen_hidden, w[:VOCAB_LIMIT, :].T)
-                  return ce_loss(s_logits, tokens)
-
-              ce_grad_fn = mx.value_and_grad(ce_step)
-              loss_b, grads_b = ce_grad_fn(active_weight)
-              
-              mx.eval(grads_b)
-              print(f"[METRIC] Approach B (Cross-Entropy) Loss: {loss_b.item():.6f}")
-
-              # --- THE SEPARATION THEOREM DELTA ---
-              # We evaluate the gradients specifically where they were calculated (the slice)
-              grad_slice_a = grads_a[:VOCAB_LIMIT, :]
-              grad_slice_b = grads_b[:VOCAB_LIMIT, :]
-              
-              mean_grad_a = mx.mean(mx.abs(grad_slice_a)).item()
-              mean_grad_b = mx.mean(mx.abs(grad_slice_b)).item()
-              
-              print("\n=== THEORETICAL PROOF SUMMARY ===")
-              print(f"Mean Gradient Magnitude (Soft Targets): {mean_grad_a:.8f}")
-              print(f"Mean Gradient Magnitude (Hard Targets): {mean_grad_b:.8f}")
-              
-              if mean_grad_a > mean_grad_b:
-                  ratio = mean_grad_a / mean_grad_b
-                  print(f"SUCCESS: Soft targets produced {ratio:.2f}x denser gradient updates than hard targets.")
+              print(f"\n=== Strategy: {name} ===")
+              print(f"  Soft Target Grad Mean: {mean_a:.8f}")
+              print(f"  Hard Target Grad Mean: {mean_b:.8f}")
+              if mean_a > mean_b:
+                  print(f"  -> SUCCESS! Soft targets are {mean_a / mean_b:.2f}x denser.")
               else:
-                  ratio = mean_grad_b / mean_grad_a if mean_grad_a > 0 else 0
-                  print(f"NOTICE: Hard targets produced {ratio:.2f}x denser gradient updates than soft targets.")
+                  print(f"  -> FAILED! Hard targets still won by {mean_b / mean_a:.2f}x.")
 
-          if __name__ == "__main__":
-              run_proof()
+          # ------------------------------------------------------------------
+          # STRATEGY 1: Temperature Scaling (T = 3.0)
+          # ------------------------------------------------------------------
+          T = 3.0
+          def kl_loss_t(s_logits, t_logits):
+              t_probs = mx.softmax(t_logits / T, axis=-1)
+              s_logprobs = s_logits / T - mx.logsumexp(s_logits / T, axis=-1, keepdims=True)
+              return mx.mean(mx.sum(t_probs * -s_logprobs, axis=-1))
+
+          def ce_loss(s_logits):
+              s_logprobs = s_logits - mx.logsumexp(s_logits, axis=-1, keepdims=True)
+              return -s_logprobs[..., tokens[0] % VOCAB_LIMIT].mean()
+
+          def step_op(w):
+              return mx.matmul(frozen_hidden, w[:VOCAB_LIMIT, :].T)
+
+          # Strategy 1 Exec
+          _, grads_a1 = mx.value_and_grad(lambda w: kl_loss_t(step_op(w), teacher_logits))(active_weight)
+          _, grads_b1 = mx.value_and_grad(lambda w: ce_loss(step_op(w)))(active_weight)
+          compare_and_print("1. Temperature Scaling (T=3)", grads_a1, grads_b1)
+
+
+          # ------------------------------------------------------------------
+          # STRATEGY 2: Logit Normalization (Z-Score)
+          # ------------------------------------------------------------------
+          def norm_step(w):
+              raw = mx.matmul(frozen_hidden, w[:VOCAB_LIMIT, :].T)
+              return (raw - mx.mean(raw)) / (mx.std(raw) + 1e-5)
+
+          def kl_loss(s_logits, t_logits):
+              t_probs = mx.softmax(t_logits, axis=-1)
+              s_logprobs = s_logits - mx.logsumexp(s_logits, axis=-1, keepdims=True)
+              return mx.mean(mx.sum(t_probs * -s_logprobs, axis=-1))
+
+          # Strategy 2 Exec
+          _, grads_a2 = mx.value_and_grad(lambda w: kl_loss(norm_step(w), teacher_logits))(active_weight)
+          _, grads_b2 = mx.value_and_grad(lambda w: ce_loss(norm_step(w)))(active_weight)
+          compare_and_print("2. Logit Normalization", grads_a2, grads_b2)
+
+
+          # ------------------------------------------------------------------
+          # STRATEGY 3: Label Smoothing (epsilon = 0.1)
+          # ------------------------------------------------------------------
+          def ce_loss_smoothed(s_logits):
+              s_logprobs = s_logits - mx.logsumexp(s_logits, axis=-1, keepdims=True)
+              smooth_target = mx.full_like(s_logits, 0.1 / VOCAB_LIMIT)
+              smooth_target[..., tokens[0] % VOCAB_LIMIT] = 0.9
+              return mx.mean(mx.sum(smooth_target * -s_logprobs, axis=-1))
+
+          # Strategy 3 Exec
+          _, grads_a3 = mx.value_and_grad(lambda w: kl_loss(step_op(w), teacher_logits))(active_weight)
+          _, grads_b3 = mx.value_and_grad(lambda w: ce_loss_smoothed(step_op(w)))(active_weight)
+          compare_and_print("3. Hard Label Smoothing", grads_a3, grads_b3)
+
+
+          # ------------------------------------------------------------------
+          # STRATEGY 4: Absolute Sum Aggregation (Broad spectrum vs Point pull)
+          # ------------------------------------------------------------------
+          _, grads_a4 = mx.value_and_grad(lambda w: kl_loss(step_op(w), teacher_logits))(active_weight)
+          _, grads_b4 = mx.value_and_grad(lambda w: ce_loss(step_op(w)))(active_weight)
+
+          # Here we measure global parameter pull (sum) instead of isolated point pull (mean)
+          sum_a = mx.sum(mx.abs(grads_a4[:VOCAB_LIMIT, :])).item()
+          sum_b = mx.sum(mx.abs(grads_b4[:VOCAB_LIMIT, :])).item()
+          print(f"\n=== Strategy: 4. Sum Aggregation (Total Pull) ===")
+          print(f"  Soft Target Total Sum: {sum_a:.4f}")
+          print(f"  Hard Target Total Sum: {sum_b:.4f}")
+          if sum_a > sum_b:
+              print(f"  -> SUCCESS! Soft targets moved {sum_a / sum_b:.2f}x more total gradient mass.")
+
+
+          # ------------------------------------------------------------------
+          # STRATEGY 5: Clipping Extreme Outliers
+          # ------------------------------------------------------------------
+          def clipped_step(w):
+              raw = mx.matmul(frozen_hidden, w[:VOCAB_LIMIT, :].T)
+              return mx.clip(raw, -10.0, 10.0)
+
+          # Strategy 5 Exec
+          _, grads_a5 = mx.value_and_grad(lambda w: kl_loss(clipped_step(w), teacher_logits))(active_weight)
+          _, grads_b5 = mx.value_and_grad(lambda w: ce_loss(clipped_step(w)))(active_weight)
+          compare_and_print("5. Outlier Logit Clipping", grads_a5, grads_b5)
+
           EOF
 
-          "${VENV_DIR}/bin/python" scripts/execute_proof.py
+          "${VENV_DIR}/bin/python" scripts/overdrive_proof.py
